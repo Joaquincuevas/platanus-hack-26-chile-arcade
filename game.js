@@ -34,6 +34,35 @@ const CFG = {
   ballDrag: 0.1, // 1/s, fricción del aire
   ballMax: 1500, // px/s, velocidad máxima
   ballSpinDamp: 0.3, // 1/s, amortiguación del giro visual en el aire
+
+  // --- Auto ---
+  carR: 18, // px, radio de colisión contra la arena
+  gravity: 1250, // px/s²
+  driveAccel: 950, // px/s², aceleración con joystick
+  brakeAccel: 2000, // px/s², al acelerar en sentido contrario
+  coastDecel: 380, // px/s², frenado sin input
+  maxDrive: 480, // px/s, velocidad máxima sin boost
+  maxBoostSpeed: 840, // px/s, velocidad máxima con boost en superficie
+  maxCarSpeed: 1050, // px/s, tope absoluto
+  stickNormalY: -0.45, // si n.y > esto la superficie es pared/techo (y exige velocidad)
+  stickMinSpeed: 190, // px/s, vel. tangencial mínima para seguir pegado en pared/techo
+  landAlign: 0.2, // dot(arriba del auto, normal) mínimo para aterrizar en pared/techo
+  stickGrace: 0.25, // s, tras aterrizar no se despega aunque vaya lento
+  wallRedirect: 0.35, // fracción del impacto contra pared/techo convertida en avance hacia la nariz
+  jumpSpeed: 480, // px/s, impulso del salto según la normal
+  doubleJumpSpeed: 400, // px/s, segundo salto vertical
+  doubleWindow: 1.2, // s, ventana para el segundo salto/flip
+  flipImpulse: 580, // px/s, impulso del flip en la dirección del joystick
+  flipTime: 0.42, // s, duración de la vuelta de 360°
+  flipFallCut: 0.25, // factor que deja de la caída al iniciar flip (cancela caída)
+  landLock: 0.12, // s, tras saltar no puede re-aterrizar (evita re-pegarse)
+  airRotAccel: 26, // rad/s², rotación en el aire con ←/→
+  airRotMax: 6.5, // rad/s
+  airRotDamp: 7, // 1/s, frenado de rotación sin input
+  boostAccel: 1500, // px/s² (mayor que gravity: permite volar)
+  boostUse: 33, // unidades/s
+  boostRegen: 6, // unidades/s, recarga pasiva
+  boostStart: 34, // unidades al inicio de cada kickoff
 };
 
 // ============================== MATH ================================
@@ -104,6 +133,7 @@ function createControls(scene) {
     const code = KEYBOARD_TO_ARCADE[normalizeIncomingKey(event.key)];
     if (!code) return;
     if (!held[code]) pressed[code] = true;
+    if (SND.ctx && SND.ctx.state === 'suspended') SND.ctx.resume();
     held[code] = true;
   };
   const onKeyUp = (event) => {
@@ -290,7 +320,217 @@ function ballStep(b, dt) {
 }
 
 // Hook de feedback para rebotes fuertes contra la arena (se completa en game feel).
-function onBallBounce(b, impact, s) {}
+function onBallBounce(b, impact, s) {
+  const k = Math.min(1, impact / 1200);
+  sfx('bounce', k);
+  if (impact > 600) burst(s.px, s.py, 6 + 10 * k, 0xffffff, 120 + 200 * k, 0.3, 2);
+}
+
+// ============================== CAR =================================
+// Orientación: ángulo `a` define el vector "arriba" del auto u=(sin a, -cos a) y el eje
+// r=(cos a, sin a). `face` (±1) espeja el auto: la nariz apunta a face*r.
+// En superficie u = normal, r = tangente t=(-n.y, n.x) y la velocidad es t*vt.
+function makeCar(id) {
+  return {
+    id,
+    color: id ? COL.p2 : COL.p1,
+    keys: id ? 'P2_' : 'P1_',
+    x: 0, y: 0, vx: 0, vy: 0,
+    a: 0, av: 0, face: 1,
+    ground: false, nx: 0, ny: -1, groundT: 0,
+    latchKey: null, latch: 0,
+    airT: 0, landLock: 0, canDouble: false,
+    flipT: 0, spin: 0, flipHit: false,
+    boost: CFG.boostStart, boosting: false,
+    inp: { sx: 0, sy: 0, boost: false, jump: false },
+    da: 0, dface: 1, // ángulo/escala mostrados (suavizados)
+    frozen: false,
+  };
+}
+
+function placeCar(c, x, face) {
+  Object.assign(c, {
+    x, y: CFG.arenaB - CFG.carR, vx: 0, vy: 0, a: 0, av: 0, face, dface: face, da: 0,
+    ground: true, nx: 0, ny: -1, latchKey: null, latch: 0, flipT: 0,
+    canDouble: false, boost: CFG.boostStart, boosting: false,
+  });
+}
+
+function readInput(c) {
+  const k = c.keys;
+  c.inp.sx = (held[k + 'R'] ? 1 : 0) - (held[k + 'L'] ? 1 : 0);
+  c.inp.sy = (held[k + 'D'] ? 1 : 0) - (held[k + 'U'] ? 1 : 0);
+  c.inp.boost = !!held[k + '2'];
+  c.inp.jump = consume(k + '1');
+}
+
+function carStep(c, dt, jumpNow) {
+  if (c.frozen) return;
+  c.boosting = c.inp.boost && c.boost > 0;
+  if (c.boosting) c.boost = Math.max(0, c.boost - CFG.boostUse * dt);
+  else c.boost = Math.min(100, c.boost + CFG.boostRegen * dt);
+  if (c.ground) groundStep(c, dt, jumpNow);
+  else airStep(c, dt, jumpNow);
+  c.a = wrapAngle(c.a);
+}
+
+function groundStep(c, dt, jumpNow) {
+  const s = closestSurface(c.x, c.y);
+  const tx = -s.ny;
+  const ty = s.nx;
+  c.nx = s.nx;
+  c.ny = s.ny;
+  if (jumpNow) {
+    jump(c);
+    airStep(c, dt, false);
+    return;
+  }
+  let vt = c.vx * tx + c.vy * ty;
+  // Dirección del joystick proyectada a la tangente, "latcheada" mientras no cambien las
+  // teclas: mantener → recorre rampa, pared y techo sin cambiar de tecla.
+  const key = c.inp.sx * 3 + c.inp.sy;
+  if (key !== c.latchKey) {
+    c.latchKey = key;
+    const d = c.inp.sx * tx + c.inp.sy * ty;
+    c.latch = Math.abs(d) > 0.3 ? sign(d) : 0;
+  }
+  const th = c.latch;
+  if (th) {
+    c.face = th;
+    const along = vt * th;
+    if (along < 0) vt += th * CFG.brakeAccel * dt;
+    else if (along < CFG.maxDrive) vt = th * Math.min(along + CFG.driveAccel * dt, CFG.maxDrive);
+    else if (!c.boosting) vt = th * Math.max(CFG.maxDrive, along - CFG.coastDecel * dt);
+  } else if (!c.boosting) {
+    const dec = CFG.coastDecel * dt;
+    vt = Math.abs(vt) <= dec ? 0 : vt - sign(vt) * dec;
+  }
+  if (c.boosting) {
+    const along = vt * c.face;
+    if (along < CFG.maxBoostSpeed) vt = c.face * Math.min(along + CFG.boostAccel * dt, CFG.maxBoostSpeed);
+  }
+  vt += CFG.gravity * ty * dt; // componente tangencial de la gravedad (rampas)
+  vt = clamp(vt, -CFG.maxCarSpeed, CFG.maxCarSpeed);
+  // Pared/techo sin velocidad suficiente → se despega.
+  c.groundT += dt;
+  if (s.ny > CFG.stickNormalY && Math.abs(vt) < CFG.stickMinSpeed && c.groundT > CFG.stickGrace) {
+    c.ground = false;
+    c.vx = tx * vt + s.nx * 60;
+    c.vy = ty * vt + s.ny * 60;
+    leaveGround(c, false);
+    return;
+  }
+  // Avanzar por la tangente y re-proyectar sobre la superficie.
+  c.x += tx * vt * dt;
+  c.y += ty * vt * dt;
+  attach(c, vt);
+}
+
+// Pega el auto a la superficie más cercana conservando la velocidad tangencial vt.
+function attach(c, vt) {
+  const s = closestSurface(c.x, c.y);
+  c.x += s.nx * (CFG.carR - s.dist);
+  c.y += s.ny * (CFG.carR - s.dist);
+  c.nx = s.nx;
+  c.ny = s.ny;
+  c.vx = -s.ny * vt;
+  c.vy = s.nx * vt;
+  c.a = Math.atan2(s.nx, -s.ny);
+}
+
+function leaveGround(c, jumped) {
+  c.ground = false;
+  c.airT = 0;
+  c.av = 0;
+  c.canDouble = true; // el segundo salto también sirve si cayó sin saltar
+  c.landLock = jumped ? CFG.landLock : 0.05;
+}
+
+function jump(c) {
+  c.vx += c.nx * CFG.jumpSpeed;
+  c.vy += c.ny * CFG.jumpSpeed;
+  leaveGround(c, true);
+  sfx('jump');
+  burst(c.x - c.nx * CFG.carR, c.y - c.ny * CFG.carR, 8, 0xffffff, 140, 0.3, 3);
+}
+
+// Segundo salto: sin dirección = doble salto vertical; con dirección = flip/dodge.
+function secondJump(c) {
+  c.canDouble = false;
+  const { sx, sy } = c.inp;
+  if (!sx && !sy) {
+    c.vy = Math.min(c.vy, 0) - CFG.doubleJumpSpeed;
+    sfx('jump2');
+    burst(c.x, c.y + 10, 10, c.color, 160, 0.35, 3);
+    return;
+  }
+  const d = norm(sx, sy, 0, -1);
+  if (c.vy > 0) c.vy *= CFG.flipFallCut;
+  c.vx += d.x * CFG.flipImpulse;
+  c.vy += d.y * CFG.flipImpulse;
+  c.flipT = CFG.flipTime;
+  c.flipHit = false;
+  c.spin = sx ? sign(sx) : sy < 0 ? -c.face : c.face;
+  c.av = 0;
+  sfx('flip');
+  burst(c.x, c.y, 14, c.color, 220, 0.4, 3);
+}
+
+function airStep(c, dt, jumpNow) {
+  c.airT += dt;
+  c.landLock -= dt;
+  if (jumpNow && c.canDouble && c.airT < CFG.doubleWindow) secondJump(c);
+  if (c.flipT > 0) {
+    c.flipT -= dt;
+    c.a += ((c.spin * Math.PI * 2) / CFG.flipTime) * dt;
+  } else {
+    // Pitch: ← antihorario, → horario.
+    if (c.inp.sx) c.av += c.inp.sx * CFG.airRotAccel * dt;
+    else c.av *= Math.max(0, 1 - CFG.airRotDamp * dt);
+    c.av = clamp(c.av, -CFG.airRotMax, CFG.airRotMax);
+    c.a += c.av * dt;
+  }
+  c.vy += CFG.gravity * dt;
+  if (c.boosting) {
+    c.vx += c.face * Math.cos(c.a) * CFG.boostAccel * dt;
+    c.vy += c.face * Math.sin(c.a) * CFG.boostAccel * dt;
+  }
+  const sp = len(c.vx, c.vy);
+  if (sp > CFG.maxCarSpeed) {
+    c.vx *= CFG.maxCarSpeed / sp;
+    c.vy *= CFG.maxCarSpeed / sp;
+  }
+  c.x += c.vx * dt;
+  c.y += c.vy * dt;
+  const s = closestSurface(c.x, c.y);
+  if (s.dist >= CFG.carR) return;
+  const up = Math.sin(c.a) * s.nx - Math.cos(c.a) * s.ny; // dot(arriba, normal)
+  const vn = c.vx * s.nx + c.vy * s.ny;
+  // Aterriza si las ruedas miran a la superficie (en el piso siempre: arcade).
+  if (c.landLock <= 0 && vn <= 1 && (up > CFG.landAlign || s.ny < -0.7)) {
+    land(c, -vn, s);
+  } else {
+    resolveCircle(c, CFG.carR, s, 0.25, 0.1, 30);
+    c.av += sign(c.vx * -s.ny + c.vy * s.nx) * 2;
+  }
+}
+
+function land(c, impact, s) {
+  c.ground = true;
+  c.flipT = 0;
+  c.av = 0;
+  c.canDouble = false;
+  c.latchKey = null;
+  c.groundT = 0;
+  let vt = c.vx * -s.ny + c.vy * s.nx;
+  if (s.ny > CFG.stickNormalY) vt += c.face * impact * CFG.wallRedirect;
+  attach(c, vt);
+  if (impact > 120) {
+    const k = Math.min(1, impact / 900);
+    burst(s.px, s.py, 4 + k * 14, 0x9aa0ff, 80 + 200 * k, 0.35, 3);
+    sfx('land', k);
+  }
+}
 
 // ============================== RENDER ==============================
 const COL = {
@@ -391,12 +631,116 @@ function makeBallGfx(scene) {
   return g;
 }
 
+// Gráfico del auto en coordenadas locales: nariz hacia +x, ruedas hacia +y.
+// El centro (0,0) es el centro del círculo de colisión; las ruedas tocan y=+carR.
+function makeCarGfx(scene, c) {
+  const g = scene.add.graphics().setDepth(10);
+  const col = c.color;
+  // Alerón
+  g.fillStyle(col, 1);
+  g.fillRect(-23, -6, 5, 7);
+  // Cabina
+  g.fillStyle(0x10121f, 1);
+  g.lineStyle(2, col, 1);
+  const cab = [
+    { x: -12, y: 0 },
+    { x: -6, y: -9 },
+    { x: 8, y: -9 },
+    { x: 15, y: 0 },
+  ];
+  g.fillPoints(cab, true);
+  g.strokePoints(cab, true);
+  // Carrocería
+  g.fillStyle(col, 1);
+  g.fillPoints(
+    [
+      { x: -22, y: 0 },
+      { x: 17, y: 0 },
+      { x: 23, y: 5 },
+      { x: 23, y: 11 },
+      { x: -22, y: 11 },
+    ],
+    true
+  );
+  g.fillStyle(0x000000, 0.35);
+  g.fillRect(-22, 7, 45, 4);
+  // Faro
+  g.fillStyle(0xffffff, 1);
+  g.fillRect(19, 3, 4, 3);
+  // Ruedas
+  for (const wx of [-13, 13]) {
+    g.fillStyle(0x15161f, 1);
+    g.fillCircle(wx, 12, 6);
+    g.lineStyle(2, 0xdddddd, 1);
+    g.strokeCircle(wx, 12, 3);
+  }
+  addGlow(g, col, 2);
+  return g;
+}
+
+// --- Partículas propias (dibujadas en un Graphics compartido) ---
+const parts = [];
+function burst(x, y, n, color, speed, life, size) {
+  for (let i = 0; i < n && parts.length < 400; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const v = speed * (0.3 + Math.random() * 0.7);
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, t: life, life, color, size });
+  }
+}
+// Partícula con velocidad dada (estelas de boost).
+function spark(x, y, vx, vy, color, life, size) {
+  if (parts.length < 400) parts.push({ x, y, vx, vy, t: life, life, color, size });
+}
+function drawParticles(fx, dt) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.t -= dt;
+    if (p.t <= 0) {
+      parts.splice(i, 1);
+      continue;
+    }
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= 1 - 2 * dt;
+    p.vy *= 1 - 2 * dt;
+    const k = p.t / p.life;
+    fx.fillStyle(p.color, k);
+    fx.fillRect(p.x - p.size * k, p.y - p.size * k, p.size * 2 * k, p.size * 2 * k);
+  }
+}
+
+// Llama de boost detrás del auto.
+function drawFlame(fx, c) {
+  const fx_ = c.face * Math.cos(c.da);
+  const fy_ = c.face * Math.sin(c.da);
+  const ux = Math.sin(c.da);
+  const uy = -Math.cos(c.da);
+  const bx = c.x - fx_ * 23 - ux * 3;
+  const by = c.y - fy_ * 23 - uy * 3;
+  const L = 18 + Math.random() * 14;
+  fx.fillStyle(c.color, 0.9);
+  fx.fillTriangle(bx + ux * 6, by + uy * 6, bx - ux * 3, by - uy * 3, bx - fx_ * L, by - fy_ * L);
+  fx.fillStyle(0xffffff, 0.9);
+  fx.fillTriangle(bx + ux * 3, by + uy * 3, bx, by, bx - fx_ * L * 0.5, by - fy_ * L * 0.5);
+  spark(bx, by, -fx_ * 260 + (Math.random() - 0.5) * 80, -fy_ * 260 + (Math.random() - 0.5) * 80, c.color, 0.3, 3);
+}
+
 // Render de objetos dinámicos (a tasa de pantalla).
 function render(scene, dt) {
   const b = G.ball;
   G.ballGfx.setVisible(b.active).setPosition(b.x, b.y).setRotation(b.rot);
   const fx = G.fx;
   fx.clear();
+  for (const c of G.cars) {
+    // Ángulo mostrado: directo en el aire, suavizado en superficie (aterrizajes).
+    c.da = c.ground ? c.da + wrapAngle(c.a - c.da) * Math.min(1, 30 * dt) : c.a;
+    // Giro visual al cambiar de sentido (escala X pasa por 0).
+    c.dface += clamp(c.face - c.dface, -14 * dt, 14 * dt);
+    c.gfx.setPosition(c.x, c.y).setRotation(c.da).setScale(c.dface, 1);
+    if (c.boosting && !c.frozen) drawFlame(fx, c);
+    engineUpdate(c);
+  }
+  drawParticles(fx, dt);
   // Estela de la pelota según velocidad
   b.trail.unshift({ x: b.x, y: b.y });
   if (b.trail.length > 10) b.trail.pop();
@@ -408,6 +752,122 @@ function render(scene, dt) {
       fx.fillCircle(p.x, p.y, CFG.ballR * (1 - i / 14));
     });
   }
+}
+
+// ============================== AUDIO ===============================
+// Todo generado con Web Audio (osciladores + ruido). Silencioso si no hay contexto.
+const SND = { ctx: null, out: null, noise: null, loops: [] };
+
+function audioInit(scene) {
+  const ctx = scene.sound && scene.sound.context;
+  if (!ctx) return;
+  SND.ctx = ctx;
+  SND.out = ctx.createGain();
+  SND.out.gain.value = 0.5;
+  SND.out.connect(ctx.destination);
+  const buf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  SND.noise = buf;
+}
+
+function audioOk() {
+  return SND.ctx && SND.ctx.state === 'running';
+}
+
+// Tono con barrido de frecuencia f0→f1 y envolvente exponencial.
+function tone(f0, f1, dur, type, vol, delay = 0) {
+  if (!audioOk()) return;
+  const c = SND.ctx;
+  const t = c.currentTime + delay;
+  const o = c.createOscillator();
+  const g = c.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(SND.out);
+  o.start(t);
+  o.stop(t + dur + 0.02);
+}
+
+// Ráfaga de ruido filtrado.
+function noise(dur, vol, freq, type = 'lowpass', delay = 0) {
+  if (!audioOk()) return;
+  const c = SND.ctx;
+  const t = c.currentTime + delay;
+  const s = c.createBufferSource();
+  s.buffer = SND.noise;
+  const f = c.createBiquadFilter();
+  f.type = type;
+  f.frequency.value = freq;
+  const g = c.createGain();
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  s.connect(f).connect(g).connect(SND.out);
+  s.start(t, Math.random() * 0.5);
+  s.stop(t + dur + 0.02);
+}
+
+// Efectos con nombre. k: intensidad 0..1.
+function sfx(name, k = 1) {
+  if (name === 'jump') tone(260, 520, 0.1, 'square', 0.05);
+  else if (name === 'jump2') tone(380, 760, 0.1, 'square', 0.05);
+  else if (name === 'flip') {
+    tone(300, 900, 0.18, 'triangle', 0.08);
+    noise(0.2, 0.08, 2500, 'bandpass');
+  } else if (name === 'land') {
+    tone(110, 45, 0.1, 'sine', 0.15 * k + 0.05);
+    noise(0.06, 0.05 + 0.1 * k, 900);
+  } else if (name === 'hit') {
+    tone(160, 50, 0.16, 'sine', 0.2 + 0.4 * k);
+    noise(0.1 + 0.1 * k, 0.12 + 0.3 * k, 1200 + 3000 * k);
+  } else if (name === 'bounce') {
+    tone(140, 70, 0.08, 'sine', 0.12 * k);
+  } else if (name === 'bump') {
+    noise(0.08, 0.15 * k, 600);
+  } else if (name === 'beep') tone(440, 440, 0.15, 'square', 0.06);
+  else if (name === 'go') tone(880, 880, 0.35, 'square', 0.07);
+  else if (name === 'goal') {
+    [523, 659, 784, 1047].forEach((f, i) => tone(f, f, 0.25, 'square', 0.07, i * 0.09));
+    noise(0.9, 0.35, 1800);
+    tone(90, 30, 0.6, 'sine', 0.5);
+  }
+}
+
+// Motor + boost continuos por auto (nodos persistentes con ganancia modulada).
+function engineUpdate(c) {
+  if (!audioOk()) return;
+  const ctx = SND.ctx;
+  let L = SND.loops[c.id];
+  if (!L) {
+    const o = ctx.createOscillator();
+    o.type = 'sawtooth';
+    const lp = ctx.createBiquadFilter();
+    lp.frequency.value = 500;
+    const g = ctx.createGain();
+    g.gain.value = 0;
+    o.connect(lp).connect(g).connect(SND.out);
+    o.start();
+    const n = ctx.createBufferSource();
+    n.buffer = SND.noise;
+    n.loop = true;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = c.id ? 1500 : 1100;
+    const bg = ctx.createGain();
+    bg.gain.value = 0;
+    n.connect(bp).connect(bg).connect(SND.out);
+    n.start();
+    L = SND.loops[c.id] = { o, g, bg };
+  }
+  const t = ctx.currentTime;
+  const sp = len(c.vx, c.vy);
+  const on = !c.frozen;
+  L.o.frequency.setTargetAtTime(45 + sp * 0.14 + (c.id ? 8 : 0), t, 0.05);
+  L.g.gain.setTargetAtTime(on ? 0.015 + Math.min(sp, 900) * 0.00004 : 0, t, 0.08);
+  L.bg.gain.setTargetAtTime(on && c.boosting ? 0.1 : 0, t, 0.04);
 }
 
 // ============================== GAME STATE ==========================
@@ -423,10 +883,16 @@ const G = {
 function step(dt) {
   G.steps++;
   const b = G.ball;
-  const vmax = len(b.vx, b.vy);
+  let vmax = len(b.vx, b.vy);
+  for (const c of G.cars) {
+    readInput(c);
+    vmax = Math.max(vmax, len(c.vx, c.vy));
+  }
   const n = clamp(Math.ceil((vmax * dt) / CFG.maxSubStep), 1, 8);
   const h = dt / n;
   for (let i = 0; i < n; i++) {
+    // El flanco de salto se aplica solo en el primer sub-paso.
+    for (const c of G.cars) carStep(c, h, i === 0 && c.inp.jump);
     ballStep(b, h);
   }
 }
@@ -454,6 +920,10 @@ function create() {
   G.ball.vx = 900;
   G.ball.vy = -500;
   G.ballGfx = makeBallGfx(this);
+  G.cars = [makeCar(0)];
+  placeCar(G.cars[0], CFG.arenaL + 200, 1);
+  for (const c of G.cars) c.gfx = makeCarGfx(this, c);
+  audioInit(this);
 }
 
 // Loop: tiempo real → acumulador → pasos fijos de CFG.dt. Render a la tasa del monitor.
