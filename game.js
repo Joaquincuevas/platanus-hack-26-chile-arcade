@@ -23,6 +23,17 @@ const CFG = {
   barR: 7, // px, radio (grosor/2) del travesaño
   goalLine: 10, // px, cuánto debe pasar el centro de la pelota el extremo del travesaño para ser gol
   glow: true, // bool, usa postFX glow si hay WebGL
+
+  // --- Pelota ---
+  ballR: 32, // px
+  ballGravity: 820, // px/s² (menor que la del auto: se siente "flotante")
+  ballRest: 0.75, // restitución contra la arena
+  ballRestV: 45, // px/s, bajo esta velocidad normal no rebota (reposo estable)
+  ballImpactFric: 0.06, // fracción de vel. tangencial perdida en cada impacto
+  ballRollFric: 0.35, // 1/s, resistencia al rodar mientras está en contacto
+  ballDrag: 0.1, // 1/s, fricción del aire
+  ballMax: 1500, // px/s, velocidad máxima
+  ballSpinDamp: 0.3, // 1/s, amortiguación del giro visual en el aire
 };
 
 // ============================== MATH ================================
@@ -243,6 +254,44 @@ function collideCircle(b, r, e, fr, restV, withBars) {
   return { impact: best, s: surf };
 }
 
+// ============================== BALL ================================
+function makeBall() {
+  return { x: A.cx, y: A.cy, vx: 0, vy: 0, spin: 0, rot: 0, active: true, trail: [] };
+}
+
+function ballStep(b, dt) {
+  if (!b.active) return;
+  b.vy += CFG.ballGravity * dt;
+  const k = Math.max(0, 1 - CFG.ballDrag * dt);
+  b.vx *= k;
+  b.vy *= k;
+  const sp = len(b.vx, b.vy);
+  if (sp > CFG.ballMax) {
+    b.vx *= CFG.ballMax / sp;
+    b.vy *= CFG.ballMax / sp;
+  }
+  b.x += b.vx * dt;
+  b.y += b.vy * dt;
+  const c = collideCircle(b, CFG.ballR, CFG.ballRest, CFG.ballImpactFric, CFG.ballRestV, true);
+  if (c.s) {
+    // En contacto: resistencia al rodar y giro = velocidad tangencial / radio.
+    const tx = -c.s.ny;
+    const ty = c.s.nx;
+    const vt = (b.vx * tx + b.vy * ty) * Math.max(0, 1 - CFG.ballRollFric * dt);
+    const vn = b.vx * c.s.nx + b.vy * c.s.ny;
+    b.vx = tx * vt + c.s.nx * vn;
+    b.vy = ty * vt + c.s.ny * vn;
+    b.spin = vt / CFG.ballR;
+    if (c.impact > 250) onBallBounce(b, c.impact, c.s);
+  } else {
+    b.spin *= Math.max(0, 1 - CFG.ballSpinDamp * dt);
+  }
+  b.rot += b.spin * dt;
+}
+
+// Hook de feedback para rebotes fuertes contra la arena (se completa en game feel).
+function onBallBounce(b, impact, s) {}
+
 // ============================== RENDER ==============================
 const COL = {
   bg: 0x05060c,
@@ -319,6 +368,48 @@ function drawArena(scene) {
   });
 }
 
+// Glow opcional (solo WebGL).
+function addGlow(obj, color, strength) {
+  if (CFG.glow && obj.postFX) obj.postFX.addGlow(color, strength, 0, false, 0.1, 12);
+}
+
+// Gráfico de la pelota en coordenadas locales (rota con b.rot).
+function makeBallGfx(scene) {
+  const r = CFG.ballR;
+  const g = scene.add.graphics().setDepth(8);
+  g.fillStyle(COL.ball, 1);
+  g.fillCircle(0, 0, r);
+  g.lineStyle(3, 0x8f95c8, 1);
+  for (let i = 0; i < 3; i++) {
+    const a = (i * Math.PI * 2) / 3;
+    g.lineBetween(Math.cos(a) * 9, Math.sin(a) * 9, Math.cos(a) * r, Math.sin(a) * r);
+  }
+  g.strokeCircle(0, 0, 9);
+  g.lineStyle(3, 0xffffff, 1);
+  g.strokeCircle(0, 0, r - 1);
+  addGlow(g, 0xffffff, 3);
+  return g;
+}
+
+// Render de objetos dinámicos (a tasa de pantalla).
+function render(scene, dt) {
+  const b = G.ball;
+  G.ballGfx.setVisible(b.active).setPosition(b.x, b.y).setRotation(b.rot);
+  const fx = G.fx;
+  fx.clear();
+  // Estela de la pelota según velocidad
+  b.trail.unshift({ x: b.x, y: b.y });
+  if (b.trail.length > 10) b.trail.pop();
+  const sp = len(b.vx, b.vy);
+  if (b.active && sp > 450) {
+    const a = Math.min(1, (sp - 450) / 700);
+    b.trail.forEach((p, i) => {
+      fx.fillStyle(0xffffff, (0.25 * a * (10 - i)) / 10);
+      fx.fillCircle(p.x, p.y, CFG.ballR * (1 - i / 14));
+    });
+  }
+}
+
 // ============================== GAME STATE ==========================
 // Estado global de la partida (un solo partido a la vez).
 const G = {
@@ -328,9 +419,16 @@ const G = {
   steps: 0, // contador de pasos de física (debug)
 };
 
-// Un paso fijo de física.
+// Un paso fijo de física, subdividido si algo se mueve rápido (anti-túnel).
 function step(dt) {
   G.steps++;
+  const b = G.ball;
+  const vmax = len(b.vx, b.vy);
+  const n = clamp(Math.ceil((vmax * dt) / CFG.maxSubStep), 1, 8);
+  const h = dt / n;
+  for (let i = 0; i < n; i++) {
+    ballStep(b, h);
+  }
 }
 
 new Phaser.Game({
@@ -351,6 +449,11 @@ new Phaser.Game({
 function create() {
   createControls(this);
   drawArena(this);
+  G.fx = this.add.graphics().setDepth(6);
+  G.ball = makeBall();
+  G.ball.vx = 900;
+  G.ball.vy = -500;
+  G.ballGfx = makeBallGfx(this);
 }
 
 // Loop: tiempo real → acumulador → pasos fijos de CFG.dt. Render a la tasa del monitor.
@@ -365,4 +468,5 @@ function update(time, deltaMs) {
       G.acc -= CFG.dt;
     }
   }
+  render(this, dt);
 }
