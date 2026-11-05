@@ -75,6 +75,14 @@ const CFG = {
   hitFeelMin: 500, // px/s de cambio de velocidad para hit-stop + shake
   hitStop: 0.05, // s, congelamiento en golpes fuertes
   shakeMax: 0.018, // intensidad máx. de screen shake (fracción de pantalla)
+
+  // --- Partido ---
+  countdown: 3, // s, cuenta regresiva del kickoff
+  goalPause: 2.4, // s, celebración tras un gol antes del kickoff
+  goalSlowMo: 0.3, // escala de tiempo durante la celebración
+  goalSlowMoTime: 0.9, // s, duración de la cámara lenta
+  kickoffX: 200, // px, distancia de cada auto a su pared en el kickoff
+  ballSpawnY: 300, // px, altura desde donde cae la pelota en el kickoff
   carCarRest: 0.3, // restitución auto–auto
   carCarMinPush: 120, // px/s, empuje mínimo entre autos al tocarse
 };
@@ -984,6 +992,52 @@ function engineUpdate(c) {
   L.bg.gain.setTargetAtTime(on && c.boosting ? 0.1 : 0, t, 0.04);
 }
 
+// ============================== UI ==================================
+const FONT = 'monospace';
+
+function createUI(scene) {
+  const st = (size, color) => ({ fontFamily: FONT, fontSize: size + 'px', fontStyle: 'bold', color });
+  G.ui = {
+    score: [
+      scene.add.text(340, 36, '0', st(40, '#e1ff00')).setOrigin(0.5).setDepth(30),
+      scene.add.text(460, 36, '0', st(40, '#ff6ec7')).setOrigin(0.5).setDepth(30),
+    ],
+    big: scene.add.text(W / 2, 250, '', st(96, '#ffffff')).setOrigin(0.5).setDepth(40).setAlpha(0),
+    hud: scene.add.graphics().setDepth(30),
+  };
+  scene.add.text(W / 2, 36, 'VS', st(18, '#6b6bff')).setOrigin(0.5).setDepth(30);
+  scene.add.text(30, 14, 'P1', st(14, '#e1ff00')).setDepth(30);
+  scene.add.text(W - 30, 14, 'P2', st(14, '#ff6ec7')).setOrigin(1, 0).setDepth(30);
+  scene.add.text(W / 2, 6, 'TURBO GOL', st(12, '#e1ff00')).setOrigin(0.5, 0).setDepth(30);
+}
+
+// Texto grande central con "pop".
+function showBig(txt, color, ms) {
+  const t = G.ui.big;
+  G.scene.tweens.killTweensOf(t);
+  t.setText(txt).setColor(color).setAlpha(1).setScale(1.6);
+  G.scene.tweens.add({ targets: t, scale: 1, duration: 250, ease: 'Back.Out' });
+  G.scene.tweens.add({ targets: t, alpha: 0, delay: ms * 0.6, duration: ms * 0.4 });
+}
+
+// Barras de boost.
+function drawHud() {
+  const g = G.ui.hud;
+  g.clear();
+  G.cars.forEach((c, i) => {
+    const w = 200;
+    const x = i ? W - 30 - w : 30;
+    const y = 36;
+    g.fillStyle(0x1a1d3a, 1);
+    g.fillRect(x, y, w, 12);
+    const f = (w * c.boost) / 100;
+    g.fillStyle(c.color, c.boosting ? 1 : 0.8);
+    g.fillRect(i ? x + w - f : x, y, f, 12);
+    g.lineStyle(1, c.color, 0.6);
+    g.strokeRect(x, y, w, 12);
+  });
+}
+
 // ============================== GAME STATE ==========================
 // Estado global de la partida (un solo partido a la vez).
 const G = {
@@ -993,7 +1047,75 @@ const G = {
   steps: 0, // contador de pasos de física (debug)
   time: 0, // s, tiempo real acumulado
   lastHit: -1, // s, último sonido de golpe (evita spam)
+  mode: 'countdown', // 'countdown' | 'play' | 'goal'
+  modeT: 0, // s, tiempo restante del modo
+  lastCount: 0,
+  score: [0, 0],
 };
+
+// Reinicia posiciones y arranca la cuenta regresiva.
+function kickoff() {
+  placeCar(G.cars[0], CFG.arenaL + CFG.kickoffX, 1);
+  placeCar(G.cars[1], CFG.arenaR - CFG.kickoffX, -1);
+  for (const c of G.cars) c.frozen = true;
+  Object.assign(G.ball, { x: A.cx, y: CFG.ballSpawnY, vx: 0, vy: 0, spin: 0, rot: 0, active: true, trail: [] });
+  G.mode = 'countdown';
+  G.modeT = CFG.countdown;
+  G.lastCount = 0;
+  G.timeScale = 1;
+  G.acc = 0;
+}
+
+// Gol a favor de `scorer` (0 = P1, 1 = P2).
+function goal(scorer) {
+  const b = G.ball;
+  G.score[scorer]++;
+  G.mode = 'goal';
+  G.modeT = CFG.goalPause;
+  G.timeScale = CFG.goalSlowMo;
+  b.active = false;
+  const col = scorer ? COL.p2 : COL.p1;
+  burst(b.x, b.y, 90, col, 650, 1.1, 4);
+  burst(b.x, b.y, 40, 0xffffff, 450, 0.8, 3);
+  shake(450, 0.03);
+  G.cam.flash(250, scorer ? 255 : 225, scorer ? 110 : 255, scorer ? 199 : 0);
+  sfx('goal');
+  const t = G.ui.score[scorer];
+  t.setText(String(G.score[scorer]));
+  G.scene.tweens.add({ targets: t, scale: { from: 2.2, to: 1 }, duration: 500, ease: 'Back.Out' });
+  showBig(scorer ? '¡GOL P2!' : '¡GOL P1!', scorer ? '#ff6ec7' : '#e1ff00', 1500);
+}
+
+// Gol si el centro de la pelota pasó bajo el travesaño hasta cerca del fondo del arco.
+function checkGoal() {
+  const b = G.ball;
+  if (!b.active || b.y < A.barY) return;
+  if (b.x < CFG.arenaL + CFG.goalD - CFG.goalLine) goal(1);
+  else if (b.x > CFG.arenaR - CFG.goalD + CFG.goalLine) goal(0);
+}
+
+// Máquina de estados de la partida (tiempo real, no escala con cámara lenta).
+function tickMode(dt) {
+  G.modeT -= dt;
+  if (G.mode === 'countdown') {
+    const n = Math.ceil(G.modeT);
+    if (n !== G.lastCount && n > 0) {
+      G.lastCount = n;
+      showBig(String(n), '#ffffff', 700);
+      sfx('beep');
+    }
+    if (G.modeT <= 0) {
+      G.mode = 'play';
+      for (const c of G.cars) c.frozen = false;
+      for (const k in pressed) pressed[k] = false;
+      showBig('¡YA!', '#e1ff00', 600);
+      sfx('go');
+    }
+  } else if (G.mode === 'goal') {
+    if (G.modeT < CFG.goalPause - CFG.goalSlowMoTime) G.timeScale = Math.min(1, G.timeScale + dt * 2);
+    if (G.modeT <= 0) kickoff();
+  }
+}
 
 // Un paso fijo de física, subdividido si algo se mueve rápido (anti-túnel).
 function step(dt) {
@@ -1012,6 +1134,7 @@ function step(dt) {
     ballStep(b, h);
     for (const c of G.cars) carBall(c, b);
     if (G.cars.length > 1) carCar(G.cars[0], G.cars[1]);
+    if (G.mode === 'play') checkGoal();
   }
 }
 
@@ -1035,24 +1158,24 @@ function create() {
   drawArena(this);
   G.cam = this.cameras.main;
   G.fx = this.add.graphics().setDepth(6);
+  G.scene = this;
   G.ball = makeBall();
-  G.ball.vx = 900;
-  G.ball.vy = -500;
   G.ballGfx = makeBallGfx(this);
   G.cars = [makeCar(0), makeCar(1)];
-  placeCar(G.cars[0], CFG.arenaL + 200, 1);
-  placeCar(G.cars[1], CFG.arenaR - 200, -1);
   for (const c of G.cars) c.gfx = makeCarGfx(this, c);
   audioInit(this);
+  createUI(this);
+  kickoff();
 }
 
 // Loop: tiempo real → acumulador → pasos fijos de CFG.dt. Render a la tasa del monitor.
 function update(time, deltaMs) {
   const dt = Math.min(deltaMs / 1000, CFG.maxFrame);
   G.time += dt;
+  tickMode(dt);
   if (G.hitStop > 0) {
     G.hitStop -= dt;
-  } else {
+  } else if (G.mode !== 'countdown') {
     G.acc += dt * G.timeScale;
     while (G.acc >= CFG.dt) {
       step(CFG.dt);
@@ -1060,4 +1183,5 @@ function update(time, deltaMs) {
     }
   }
   render(this, dt);
+  drawHud();
 }
