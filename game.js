@@ -22,7 +22,7 @@ const CFG = {
   goalD: 90, // px, profundidad del arco = largo del travesaño
   barR: 7, // px, radio (grosor/2) del travesaño
   goalLine: 10, // px, cuánto debe pasar el centro de la pelota el extremo del travesaño para ser gol
-  glow: true, // bool, usa postFX glow si hay WebGL
+  glow: false, // bool, postFX glow real (WebGL). Caro: ~3x menos FPS en GPU débil
 
   // --- Pelota ---
   ballR: 32, // px
@@ -644,7 +644,8 @@ function hitFeel(x, y, f, color) {
   }
   burst(x, y, 6 + 26 * k, color, 150 + 400 * k, 0.45, 3);
   burst(x, y, 4 + 10 * k, 0xffffff, 100 + 300 * k, 0.3, 2);
-  if (f > CFG.hitFeelMin) {
+  if (f > CFG.hitFeelMin && G.time - G.lastStop > 0.2) {
+    G.lastStop = G.time;
     G.hitStop = CFG.hitStop * (0.6 + 0.4 * k);
     shake(80 + 160 * k, CFG.shakeMax * k);
   }
@@ -739,6 +740,11 @@ function addGlow(obj, color, strength) {
 function makeBallGfx(scene) {
   const r = CFG.ballR;
   const g = scene.add.graphics().setDepth(8);
+  // Halo barato (sustituto del glow)
+  g.fillStyle(0xffffff, 0.08);
+  g.fillCircle(0, 0, r + 9);
+  g.fillStyle(0xffffff, 0.15);
+  g.fillCircle(0, 0, r + 4);
   g.fillStyle(COL.ball, 1);
   g.fillCircle(0, 0, r);
   g.lineStyle(3, 0x8f95c8, 1);
@@ -758,6 +764,9 @@ function makeBallGfx(scene) {
 function makeCarGfx(scene, c) {
   const g = scene.add.graphics().setDepth(10);
   const col = c.color;
+  // Halo barato
+  g.fillStyle(col, 0.07);
+  g.fillRoundedRect(-30, -16, 60, 37, 16);
   // Alerón
   g.fillStyle(col, 1);
   g.fillRect(-23, -6, 5, 7);
@@ -1004,7 +1013,9 @@ function createUI(scene) {
     ],
     big: scene.add.text(W / 2, 250, '', st(96, '#ffffff')).setOrigin(0.5).setDepth(40).setAlpha(0),
     hud: scene.add.graphics().setDepth(30),
+    dbg: scene.add.text(26, 82, '', { fontFamily: FONT, fontSize: '11px', color: '#00ffff' }).setDepth(51),
   };
+  G.dbg = scene.add.graphics().setDepth(50);
   scene.add.text(W / 2, 36, 'VS', st(18, '#6b6bff')).setOrigin(0.5).setDepth(30);
   scene.add.text(30, 14, 'P1', st(14, '#e1ff00')).setDepth(30);
   scene.add.text(W - 30, 14, 'P2', st(14, '#ff6ec7')).setOrigin(1, 0).setDepth(30);
@@ -1038,6 +1049,51 @@ function drawHud() {
   });
 }
 
+// Overlay de debug (P1_6): hitboxes, normales, velocidades y FPS. Apagado por defecto.
+function drawDebug(scene) {
+  const g = G.dbg;
+  g.clear();
+  G.ui.dbg.setVisible(G.debug);
+  if (!G.debug) return;
+  const b = G.ball;
+  g.lineStyle(1, 0x00ffff, 1);
+  g.strokeCircle(b.x, b.y, CFG.ballR);
+  g.lineStyle(1, 0xff4040, 1);
+  g.lineBetween(b.x, b.y, b.x + b.vx * 0.1, b.y + b.vy * 0.1);
+  const bs = closestSurface(b.x, b.y);
+  g.lineStyle(1, 0x40ff40, 0.6);
+  g.lineBetween(bs.px, bs.py, bs.px + bs.nx * 30, bs.py + bs.ny * 30);
+  const lines = [
+    'FPS ' + scene.game.loop.actualFps.toFixed(0) + '  modo ' + G.mode + '  pasos ' + G.steps,
+    'pelota v=' + len(b.vx, b.vy).toFixed(0) + ' giro=' + b.spin.toFixed(1),
+  ];
+  for (const c of G.cars) {
+    // Círculo de arena + cápsula de golpe
+    g.lineStyle(1, 0x00ffff, 1);
+    g.strokeCircle(c.x, c.y, CFG.carR);
+    const ax = Math.cos(c.a) * CFG.carHitHalf;
+    const ay = Math.sin(c.a) * CFG.carHitHalf;
+    g.lineStyle(CFG.carHitR * 2, 0xffffff, 0.15);
+    g.lineBetween(c.x - ax, c.y - ay, c.x + ax, c.y + ay);
+    // Normal de la superficie más cercana y velocidad
+    const s = closestSurface(c.x, c.y);
+    g.lineStyle(2, c.ground ? 0x40ff40 : 0x408040, 1);
+    g.lineBetween(s.px, s.py, s.px + s.nx * 30, s.py + s.ny * 30);
+    g.lineStyle(2, 0xff4040, 1);
+    g.lineBetween(c.x, c.y, c.x + c.vx * 0.1, c.y + c.vy * 0.1);
+    // Nariz
+    g.lineStyle(2, 0xffff00, 1);
+    g.lineBetween(c.x, c.y, c.x + c.face * ax * 2.5, c.y + c.face * ay * 2.5);
+    lines.push(
+      'P' + (c.id + 1) + ' ' + (c.ground ? 'SUELO' : 'AIRE') + ' v=' + len(c.vx, c.vy).toFixed(0) +
+        ' ang=' + ((c.a * 180) / Math.PI).toFixed(0) + ' boost=' + c.boost.toFixed(0) +
+        (c.canDouble ? ' 2do:' + Math.max(0, CFG.doubleWindow - c.airT).toFixed(1) : '') +
+        (c.flipT > 0 ? ' FLIP' : '')
+    );
+  }
+  G.ui.dbg.setText(lines.join('\n'));
+}
+
 // ============================== GAME STATE ==========================
 // Estado global de la partida (un solo partido a la vez).
 const G = {
@@ -1047,10 +1103,12 @@ const G = {
   steps: 0, // contador de pasos de física (debug)
   time: 0, // s, tiempo real acumulado
   lastHit: -1, // s, último sonido de golpe (evita spam)
+  lastStop: -1, // s, último hit-stop (evita tartamudeo con pelota atrapada)
   mode: 'countdown', // 'countdown' | 'play' | 'goal'
   modeT: 0, // s, tiempo restante del modo
   lastCount: 0,
   score: [0, 0],
+  debug: false, // overlay de debug (toggle con P1_6)
 };
 
 // Reinicia posiciones y arranca la cuenta regresiva.
@@ -1172,6 +1230,7 @@ function create() {
 function update(time, deltaMs) {
   const dt = Math.min(deltaMs / 1000, CFG.maxFrame);
   G.time += dt;
+  if (consume('P1_6')) G.debug = !G.debug;
   tickMode(dt);
   if (G.hitStop > 0) {
     G.hitStop -= dt;
@@ -1184,4 +1243,5 @@ function update(time, deltaMs) {
   }
   render(this, dt);
   drawHud();
+  drawDebug(this);
 }
