@@ -1039,8 +1039,9 @@ function create() {
   G.ball.vx = 900;
   G.ball.vy = -500;
   G.ballGfx = makeBallGfx(this);
-  G.cars = [makeCar(0)];
+  G.cars = [makeCar(0), makeCar(1)];
   placeCar(G.cars[0], CFG.arenaL + 200, 1);
+  placeCar(G.cars[1], CFG.arenaR - 200, -1);
   for (const c of G.cars) c.gfx = makeCarGfx(this, c);
   audioInit(this);
 }
