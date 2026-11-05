@@ -63,6 +63,20 @@ const CFG = {
   boostUse: 33, // unidades/s
   boostRegen: 6, // unidades/s, recarga pasiva
   boostStart: 34, // unidades al inicio de cada kickoff
+
+  // --- Golpes ---
+  carHitHalf: 13, // px, medio largo del segmento de la cápsula de golpe del auto
+  carHitR: 10, // px, radio de la cápsula (cápsula total ≈ 46×20)
+  carMass: 2.5, // masa relativa del auto (pelota = 1)
+  hitRest: 0.55, // restitución auto–pelota
+  minHit: 240, // px/s, velocidad mínima de salida de la pelota tras cualquier toque
+  flipHitBonus: 420, // px/s extra a la pelota si el auto está en flip (una vez por flip)
+  boostHitMul: 1.2, // multiplicador del golpe si el auto usa boost
+  hitFeelMin: 500, // px/s de cambio de velocidad para hit-stop + shake
+  hitStop: 0.05, // s, congelamiento en golpes fuertes
+  shakeMax: 0.018, // intensidad máx. de screen shake (fracción de pantalla)
+  carCarRest: 0.3, // restitución auto–auto
+  carCarMinPush: 120, // px/s, empuje mínimo entre autos al tocarse
 };
 
 // ============================== MATH ================================
@@ -532,6 +546,106 @@ function land(c, impact, s) {
   }
 }
 
+// ============================== COLLISIONS ==========================
+// Auto (cápsula a lo largo de su eje) contra pelota (círculo).
+function carBall(c, b) {
+  if (c.frozen || !b.active) return;
+  const ax = Math.cos(c.a);
+  const ay = Math.sin(c.a);
+  const k = clamp((b.x - c.x) * ax + (b.y - c.y) * ay, -CFG.carHitHalf, CFG.carHitHalf);
+  const px = c.x + ax * k;
+  const py = c.y + ay * k;
+  const rr = CFG.carHitR + CFG.ballR;
+  const d = len(b.x - px, b.y - py);
+  if (d >= rr) return;
+  const n = norm(b.x - px, b.y - py, Math.sin(c.a), -Math.cos(c.a));
+  // Separar: la pelota (liviana) se mueve más.
+  const pen = rr - d;
+  const mc = CFG.carMass;
+  b.x += n.x * pen * (mc / (mc + 1));
+  b.y += n.y * pen * (mc / (mc + 1));
+  c.x -= n.x * pen * (1 / (mc + 1));
+  c.y -= n.y * pen * (1 / (mc + 1));
+  const rel = (b.vx - c.vx) * n.x + (b.vy - c.vy) * n.y;
+  if (rel >= CFG.minHit) return; // ya se separan rápido
+  // Impulso por velocidad relativa normal (masa pelota = 1).
+  const j = rel < 0 ? (-(1 + CFG.hitRest) * rel) / (1 + 1 / mc) : 0;
+  let dvb = j;
+  const after = rel + j * (1 + 1 / mc);
+  if (after < CFG.minHit) dvb += CFG.minHit - after; // todo toque se siente
+  if (c.boosting) dvb *= CFG.boostHitMul;
+  let bx = n.x * dvb;
+  let by = n.y * dvb;
+  if (c.flipT > 0 && !c.flipHit) {
+    c.flipHit = true;
+    bx += n.x * CFG.flipHitBonus;
+    by += n.y * CFG.flipHitBonus;
+  }
+  b.vx += bx;
+  b.vy += by;
+  c.vx -= (n.x * j) / mc;
+  c.vy -= (n.y * j) / mc;
+  if (c.ground) {
+    // En superficie solo conserva la componente tangencial.
+    const vt = c.vx * -c.ny + c.vy * c.nx;
+    c.vx = -c.ny * vt;
+    c.vy = c.nx * vt;
+  }
+  hitFeel(b.x - n.x * CFG.ballR, b.y - n.y * CFG.ballR, len(bx, by), c.color);
+}
+
+// Auto contra auto: círculos con empuje simple.
+function carCar(c1, c2) {
+  if (c1.frozen || c2.frozen) return;
+  const rr = CFG.carR * 2;
+  const d = len(c2.x - c1.x, c2.y - c1.y);
+  if (d >= rr) return;
+  const n = norm(c2.x - c1.x, c2.y - c1.y, c1.x < A.cx ? 1 : -1, 0);
+  const pen = (rr - d) / 2;
+  c1.x -= n.x * pen;
+  c1.y -= n.y * pen;
+  c2.x += n.x * pen;
+  c2.y += n.y * pen;
+  const rel = (c2.vx - c1.vx) * n.x + (c2.vy - c1.vy) * n.y;
+  if (rel >= CFG.carCarMinPush) return;
+  const j = Math.max((-(1 + CFG.carCarRest) * rel) / 2, (CFG.carCarMinPush - rel) / 2);
+  for (const [c, sg] of [
+    [c1, -1],
+    [c2, 1],
+  ]) {
+    c.vx += n.x * j * sg;
+    c.vy += n.y * j * sg;
+    if (c.ground) {
+      const vt = c.vx * -c.ny + c.vy * c.nx;
+      c.vx = -c.ny * vt;
+      c.vy = c.nx * vt;
+    }
+  }
+  if (j > 150) {
+    sfx('bump', Math.min(1, j / 600));
+    burst((c1.x + c2.x) / 2, (c1.y + c2.y) / 2, 8, 0xffffff, 200, 0.25, 2);
+  }
+}
+
+// Feedback de golpe: hit-stop, shake, partículas y sonido según la fuerza (px/s).
+function hitFeel(x, y, f, color) {
+  const k = Math.min(1, f / 1400);
+  if (G.time - G.lastHit > 0.06) {
+    sfx('hit', k);
+    G.lastHit = G.time;
+  }
+  burst(x, y, 6 + 26 * k, color, 150 + 400 * k, 0.45, 3);
+  burst(x, y, 4 + 10 * k, 0xffffff, 100 + 300 * k, 0.3, 2);
+  if (f > CFG.hitFeelMin) {
+    G.hitStop = CFG.hitStop * (0.6 + 0.4 * k);
+    shake(80 + 160 * k, CFG.shakeMax * k);
+  }
+}
+
+function shake(ms, intensity) {
+  if (G.cam) G.cam.shake(ms, intensity, true);
+}
+
 // ============================== RENDER ==============================
 const COL = {
   bg: 0x05060c,
@@ -877,6 +991,8 @@ const G = {
   timeScale: 1, // cámara lenta en goles
   hitStop: 0, // s, congelamiento por golpe fuerte
   steps: 0, // contador de pasos de física (debug)
+  time: 0, // s, tiempo real acumulado
+  lastHit: -1, // s, último sonido de golpe (evita spam)
 };
 
 // Un paso fijo de física, subdividido si algo se mueve rápido (anti-túnel).
@@ -894,6 +1010,8 @@ function step(dt) {
     // El flanco de salto se aplica solo en el primer sub-paso.
     for (const c of G.cars) carStep(c, h, i === 0 && c.inp.jump);
     ballStep(b, h);
+    for (const c of G.cars) carBall(c, b);
+    if (G.cars.length > 1) carCar(G.cars[0], G.cars[1]);
   }
 }
 
@@ -915,6 +1033,7 @@ new Phaser.Game({
 function create() {
   createControls(this);
   drawArena(this);
+  G.cam = this.cameras.main;
   G.fx = this.add.graphics().setDepth(6);
   G.ball = makeBall();
   G.ball.vx = 900;
@@ -929,6 +1048,7 @@ function create() {
 // Loop: tiempo real → acumulador → pasos fijos de CFG.dt. Render a la tasa del monitor.
 function update(time, deltaMs) {
   const dt = Math.min(deltaMs / 1000, CFG.maxFrame);
+  G.time += dt;
   if (G.hitStop > 0) {
     G.hitStop -= dt;
   } else {
