@@ -1519,8 +1519,11 @@ function endMatch() {
   const [a, b] = G.score;
   G.winner = a > b ? 0 : b > a ? 1 : -1;
   G.points = 0;
-  if (G.solo && G.winner === 0)
-    G.points = (a - b) * 100 + Math.ceil(G.clock) * CFG.timeBonus + G.st.demos[0] * CFG.demoBonus;
+  // Puntaje 1P (solo si gana a la CPU): diferencia + reloj restante + demoliciones.
+  if (G.solo && G.winner === 0) {
+    G.pts = [(a - b) * 100, Math.ceil(G.clock) * CFG.timeBonus, G.st.demos[0] * CFG.demoBonus];
+    G.points = G.pts[0] + G.pts[1] + G.pts[2];
+  }
   sfx('end');
   if (G.points > 0 && qualifies(G.points)) {
     G.name = { l: [0, 0, 0], i: 0 };
@@ -1547,7 +1550,7 @@ function showEnd() {
         'TIROS        ' + st.shots[0] + ' - ' + st.shots[1],
         'POSESIÓN   ' + p1 + '% - ' + (100 - p1) + '%',
         'DEMOLICIONES ' + st.demos[0] + ' - ' + st.demos[1],
-        G.points ? 'PUNTAJE ' + G.points : '',
+        G.points ? 'PUNTAJE ' + G.points + '  (' + G.pts.join(' + ') + ')' : '',
         '',
         'START para revancha',
       ].join('\n')
