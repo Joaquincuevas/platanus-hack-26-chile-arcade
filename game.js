@@ -92,6 +92,11 @@ const CFG = {
   endIdle: 15, // s sin input en END → MENU
   endDelay: 1.2, // s antes de aceptar input en END (evita saltarlo sin querer)
   nameIdle: 30, // s sin input al escribir nombre → guarda lo que haya
+  musicBpm: 132, // tempo de la música de partido (sube 15% en los últimos 10 s)
+  musicVol: 1, // multiplicador de volumen de la música (0 = sin música)
+  replayFrames: 90, // cuadros guardados para la repetición (~1.5 s a 60 fps)
+  replaySpeed: 0.4, // velocidad de la repetición (cámara lenta)
+  replayDelay: 0.9, // s de celebración antes de la repetición
   timeBonus: 2, // pts por segundo de reloj restante (si gana por diferencia antes del final)
   demoBonus: 50, // pts por demolición hecha por P1
   shotSpeed: 450, // px/s hacia el arco rival tras un toque para contar como tiro
@@ -1102,9 +1107,39 @@ function drawFlame(fx, c) {
   spark(bx, by, -fx_ * 260 + (Math.random() - 0.5) * 80, -fy_ * 260 + (Math.random() - 0.5) * 80, c.color, 0.3, 3);
 }
 
+// Reproduce un cuadro del buffer con franjas de cine y etiqueta.
+function drawReplay(dt) {
+  const R = G.replay;
+  const f = R.f[Math.min(R.f.length - 1, Math.floor(R.i))];
+  G.ballGfx.setVisible(true).setPosition(f[0], f[1]).setRotation(f[2]);
+  const fx = G.fx;
+  fx.clear();
+  G.cars.forEach((c, i) => {
+    const o = 3 + i * 6;
+    c.gfx.setVisible(!f[o + 4]).setPosition(f[o], f[o + 1]).setRotation(f[o + 2]).setScale(f[o + 3], 1);
+    if (f[o + 5]) {
+      const ax = Math.cos(f[o + 2]) * f[o + 3];
+      const ay = Math.sin(f[o + 2]) * f[o + 3];
+      spark(f[o] - ax * 24, f[o + 1] - ay * 24, -ax * 120, -ay * 120, c.color, 0.25, 3);
+    }
+  });
+  drawParticles(fx, dt * CFG.replaySpeed);
+  fx.fillStyle(0x000000, 1);
+  fx.fillRect(0, 0, W, 62);
+  fx.fillRect(0, H - 12, W, 12);
+  if (Math.floor(G.time * 2) % 2) {
+    fx.fillStyle(0xff3030, 1);
+    fx.fillCircle(30, 32, 7);
+  }
+}
+
 // Render de objetos dinámicos (a tasa de pantalla).
 function render(scene, dt) {
   const b = G.ball;
+  if (G.replay) {
+    drawReplay(dt);
+    return;
+  }
   G.ballGfx.setVisible(b.active).setPosition(b.x, b.y).setRotation(b.rot);
   const fx = G.fx;
   fx.clear();
@@ -1119,6 +1154,11 @@ function render(scene, dt) {
   }
   drawPads(fx);
   drawParticles(fx, dt);
+  // Buffer para la repetición de goles.
+  if (G.mode === 'play' && !G.demo) {
+    G.rec.push([b.x, b.y, b.rot, ...G.cars.flatMap((c) => [c.x, c.y, c.da, c.dface, c.dead, c.boosting])]);
+    if (G.rec.length > CFG.replayFrames) G.rec.shift();
+  }
   // Estela de la pelota según velocidad
   b.trail.unshift({ x: b.x, y: b.y });
   if (b.trail.length > 10) b.trail.pop();
@@ -1223,6 +1263,25 @@ function sfx(name, k = 1) {
   }
 }
 
+// Música de partido: bajo + bombo/caja/hi-hat en 16 corcheas, programada con lookahead.
+const BASS = [0, 0, 12, 0, 3, 0, 10, 7, 5, 5, 17, 5, 8, 7, 3, 2];
+function musicUpdate() {
+  if (!audioOk() || G.screen !== 'match' || !CFG.musicVol) return;
+  const now = SND.ctx.currentTime;
+  if (!(SND.next > now)) SND.next = now + 0.05;
+  const v = CFG.musicVol;
+  while (SND.next < now + 0.12) {
+    const n = (SND.step = ((SND.step || 0) + 1) % 16);
+    const t = SND.next - now;
+    if (n % 4 === 0) tone(120, 40, 0.14, 'sine', 0.22 * v, t);
+    if (n % 8 === 4) noise(0.09, 0.07 * v, 1600, 'highpass', t);
+    else if (n % 2) noise(0.025, 0.025 * v, 7000, 'highpass', t);
+    const f = 55 * Math.pow(2, BASS[n] / 12);
+    tone(f, f, 0.16, 'triangle', 0.09 * v, t);
+    SND.next += 30 / (CFG.musicBpm * (G.clock <= CFG.finalCount && !G.ot ? 1.15 : 1));
+  }
+}
+
 // Motor + boost continuos por auto (nodos persistentes con ganancia modulada).
 function engineUpdate(c) {
   if (!audioOk()) return;
@@ -1279,6 +1338,7 @@ function createUI(scene) {
     press: tx(W / 2, 270, 'PRESIONA START', 34, '#ffffff', 61),
     top: tx(W / 2, 480, '', 16, '#ffffff', 61),
     panel: tx(W / 2, 300, '', 22, '#ffffff', 61).setLineSpacing(8),
+    rep: tx(W / 2, 92, 'REPETICIÓN', 24, '#ff5050', 31).setVisible(false),
   };
   G.dbg = scene.add.graphics().setDepth(50);
   scene.tweens.add({ targets: G.ui.title, scale: 1.07, angle: 2, duration: 900, yoyo: true, repeat: -1, ease: 'Sine.InOut' });
@@ -1343,6 +1403,8 @@ function drawHud() {
   G.ui.clock
     .setText(G.ot ? 'EXTRA' : Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0'))
     .setColor(G.ot || t <= CFG.finalCount ? '#ff5050' : '#ffffff');
+  G.ui.rep.setVisible(!!G.replay);
+  G.ui.clock.setVisible(!G.replay);
   G.ui.ot.setText(G.ot ? 'GOL DE ORO' : G.clock <= 0 && G.mode === 'play' ? 'ÚLTIMA JUGADA' : '');
   G.ui.press.setAlpha(Math.floor(G.time * 2.5) % 2 ? 1 : 0.15);
 }
@@ -1468,6 +1530,9 @@ function kickoff() {
   Object.assign(G.ball, { x: A.cx, y: CFG.ballSpawnY, vx: 0, vy: 0, spin: 0, rot: 0, active: true, trail: [] });
   G.mode = 'kickoff';
   G.modeT = CFG.countdown;
+  G.rec = [];
+  G.replay = null;
+  G.replayed = false;
   G.lastCount = 0;
   G.timeScale = 1;
   G.acc = 0;
@@ -1644,6 +1709,20 @@ function tickMode(dt) {
       if (G.clock <= 0 && G.ball.onFloor) timeUp();
     }
   } else if (G.mode === 'goal') {
+    // Repetición en cámara lenta de los últimos ~1.5 s (saltable con botón 1).
+    if (G.replay) {
+      G.replay.i += dt * 60 * CFG.replaySpeed;
+      if (G.replay.i < G.replay.f.length - 1 && !consume('P1_1') && !consume('P2_1')) return;
+      G.replay = null;
+      G.modeT = 0;
+    } else if (!G.demo && !G.replayed && G.rec.length > 20 && G.modeT < CFG.goalPause - CFG.replayDelay) {
+      G.replayed = true;
+      G.replay = { f: G.rec, i: 0 };
+      G.rec = [];
+      G.scene.tweens.killTweensOf(G.ui.big);
+      G.ui.big.setAlpha(0);
+      return;
+    }
     if (G.modeT < CFG.goalPause - CFG.goalSlowMoTime) G.timeScale = Math.min(1, G.timeScale + dt * 2);
     if (G.modeT <= 0) {
       if (G.ot) endMatch();
@@ -1718,7 +1797,7 @@ function update(time, deltaMs) {
   if (live) tickMode(dt);
   if (G.hitStop > 0) {
     G.hitStop -= dt;
-  } else if (live && G.mode !== 'kickoff') {
+  } else if (live && G.mode !== 'kickoff' && !G.replay) {
     G.acc += dt * G.timeScale;
     while (G.acc >= CFG.dt) {
       step(CFG.dt);
@@ -1726,6 +1805,7 @@ function update(time, deltaMs) {
     }
   }
   render(this, dt);
+  musicUpdate();
   drawHud();
   drawDebug(this);
 }
