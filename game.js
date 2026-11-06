@@ -106,6 +106,9 @@ const CFG = {
   padPickH: 55, // px, altura máx. del auto sobre el piso para recoger
   carCarRest: 0.3, // restitución auto–auto
   carCarMinPush: 120, // px/s, empuje mínimo entre autos al tocarse
+  demoSpeed: 800, // px/s del atacante para demoler (≈95% de maxBoostSpeed: supersónico)
+  demoAim: 0.8, // cos del ángulo máx. entre la velocidad del atacante y la víctima
+  demoRespawn: 2, // s hasta que reaparece la víctima en su lado
 };
 
 // ============================== MATH ================================
@@ -435,7 +438,7 @@ function placeCar(c, x, face) {
   Object.assign(c, {
     x, y: CFG.arenaB - CFG.carR, vx: 0, vy: 0, a: 0, av: 0, face, dface: face, da: 0,
     ground: true, nx: 0, ny: -1, latchKey: null, latch: 0, flipT: 0,
-    canDouble: false, boost: CFG.boostStart, boosting: false,
+    canDouble: false, boost: CFG.boostStart, boosting: false, dead: 0, frozen: false,
   });
 }
 
@@ -681,6 +684,17 @@ function carCar(c1, c2) {
   const d = len(c2.x - c1.x, c2.y - c1.y);
   if (d >= rr) return;
   const n = norm(c2.x - c1.x, c2.y - c1.y, c1.x < A.cx ? 1 : -1, 0);
+  // Demolición: el atacante va supersónico y apuntando a la víctima.
+  for (const [att, vic, sg] of [
+    [c1, c2, 1],
+    [c2, c1, -1],
+  ]) {
+    const sp = len(att.vx, att.vy);
+    if (sp >= CFG.demoSpeed && ((att.vx * n.x + att.vy * n.y) * sg) / sp > CFG.demoAim) {
+      demolish(vic, att);
+      return;
+    }
+  }
   const pen = (rr - d) / 2;
   c1.x -= n.x * pen;
   c1.y -= n.y * pen;
@@ -704,6 +718,31 @@ function carCar(c1, c2) {
   if (j > 150) {
     sfx('bump', Math.min(1, j / 600));
     burst((c1.x + c2.x) / 2, (c1.y + c2.y) / 2, 8, 0xffffff, 200, 0.25, 2);
+  }
+}
+
+// La víctima explota y reaparece en su lado tras CFG.demoRespawn.
+function demolish(v, att) {
+  v.dead = CFG.demoRespawn;
+  v.frozen = true;
+  v.boosting = false;
+  if (G.st) G.st.demos[att.id]++;
+  burst(v.x, v.y, 70, v.color, 600, 1, 4);
+  burst(v.x, v.y, 40, 0xff8a30, 400, 0.8, 4);
+  burst(v.x, v.y, 20, 0xffffff, 250, 0.6, 3);
+  shake(400, 0.03);
+  G.hitStop = 0.09;
+  G.lastStop = G.time;
+  sfx('boom');
+  showBig('¡DEMOLIDO!', att.id ? '#ff6ec7' : '#e1ff00', 1000);
+}
+
+function respawnStep(dt) {
+  for (const c of G.cars) {
+    if (c.dead > 0 && (c.dead -= dt) <= 0) {
+      placeCar(c, c.id ? CFG.arenaR - CFG.kickoffX : CFG.arenaL + CFG.kickoffX, c.id ? -1 : 1);
+      burst(c.x, c.y, 16, c.color, 200, 0.5, 3);
+    }
   }
 }
 
@@ -1000,7 +1039,7 @@ function render(scene, dt) {
     c.da = c.ground ? c.da + wrapAngle(c.a - c.da) * Math.min(1, 30 * dt) : c.a;
     // Giro visual al cambiar de sentido (escala X pasa por 0).
     c.dface += clamp(c.face - c.dface, -14 * dt, 14 * dt);
-    c.gfx.setPosition(c.x, c.y).setRotation(c.da).setScale(c.dface, 1);
+    c.gfx.setVisible(!c.dead).setPosition(c.x, c.y).setRotation(c.da).setScale(c.dface, 1);
     if (c.boosting && !c.frozen) drawFlame(fx, c);
     engineUpdate(c);
   }
@@ -1096,6 +1135,9 @@ function sfx(name, k = 1) {
     noise(0.1 + 0.1 * k, 0.12 + 0.3 * k, 1200 + 3000 * k);
   } else if (name === 'bounce') {
     tone(140, 70, 0.08, 'sine', 0.12 * k);
+  } else if (name === 'boom') {
+    noise(0.8, 0.6, 700);
+    tone(120, 25, 0.7, 'sawtooth', 0.35);
   } else if (name === 'bump') {
     noise(0.08, 0.15 * k, 600);
   } else if (name === 'beep') tone(440, 440, 0.15, 'square', 0.06);
@@ -1555,6 +1597,7 @@ function step(dt) {
     if (G.mode === 'play') checkGoal();
   }
   padsStep(dt);
+  respawnStep(dt);
 }
 
 new Phaser.Game({
