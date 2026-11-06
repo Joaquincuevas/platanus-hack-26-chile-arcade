@@ -106,6 +106,10 @@ const CFG = {
   padPickH: 55, // px, altura máx. del auto sobre el piso para recoger
   carCarRest: 0.3, // restitución auto–auto
   carCarMinPush: 120, // px/s, empuje mínimo entre autos al tocarse
+  // --- CPU ---
+  cpuReact: 0.16, // s, retardo medio entre decisiones (más alto = más lenta)
+  cpuSkill: 0.6, // 0..1: predicción, puntería de saltos y uso de boost
+  cpuThreat: 150, // px/s de la pelota hacia su arco para volver a defender
   demoSpeed: 800, // px/s del atacante para demoler (≈95% de maxBoostSpeed: supersónico)
   demoAim: 0.8, // cos del ángulo máx. entre la velocidad del atacante y la víctima
   demoRespawn: 2, // s hasta que reaparece la víctima en su lado
@@ -815,16 +819,86 @@ function drawPads(fx) {
 }
 
 // ============================== CPU =================================
-// Genera inputs virtuales (mismas acciones que un jugador) en c.inp.
+// Genera inputs virtuales en c.inp (las mismas acciones que un jugador); no toca la física.
+// Decide cada ~CFG.cpuReact s; entre decisiones mantiene el último input (se siente humano).
+// Comportamientos: ponerse detrás de la pelota, ir a pegarle, volver a defender, saltar/flip.
 function cpuThink(c, dt) {
-  const b = G.ball;
   const i = c.inp;
+  const ai = c.ai || (c.ai = { t: 0, sx: 0, boost: false, jt: -9, over: -9, rev: 0 });
+  const b = G.ball;
+  const k = CFG.cpuSkill;
+  const dir = c.id ? -1 : 1; // hacia el arco rival
   i.jump = false;
-  const dx = b.x - c.x;
-  i.sx = Math.abs(dx) > 10 ? sign(dx) : 0;
   i.sy = 0;
+  ai.t -= dt;
+  const dx = b.x - c.x;
+  const dy = c.y - b.y; // > 0: pelota arriba del auto
+  if (c.ground) {
+    // En pared/techo no insiste: se deja caer.
+    const wall = c.ny > -0.5;
+    i.sx = wall ? 0 : ai.sx;
+    i.boost = ai.boost && !wall;
+    if (ai.t <= 0) {
+      ai.t = CFG.cpuReact * (0.6 + Math.random() * 0.8);
+      const look = 0.2 + 0.3 * k; // s de predicción de la pelota
+      let px = clamp(b.x + b.vx * look, CFG.arenaL + 50, CFG.arenaR - 50);
+      // Pelota todavía delante pero la predicción la pasa: interceptar donde está el auto.
+      if ((c.x - px) * dir > 0 && (c.x - b.x) * dir <= 0) px = c.x;
+      const own = c.id ? CFG.arenaR : CFG.arenaL;
+      const threat = (b.vx * dir < -CFG.cpuThreat && (b.x - A.cx) * dir < 120) || Math.abs(b.x - own) < 260;
+      let tx;
+      ai.back = (c.x - b.x) * dir > 0;
+      if (ai.back) {
+        // Lado equivocado: rodear por detrás o volver al arco si hay peligro.
+        tx = threat ? (c.id ? CFG.arenaR - 110 : CFG.arenaL + 110) : px - dir * 150;
+      } else tx = px + dir * 40; // ir a pegarle atravesando la pelota
+      const ddx = tx - c.x;
+      ai.sx = Math.abs(ddx) > 14 ? sign(ddx) : 0;
+      ai.boost = c.boost > 10 && (threat || Math.abs(ddx) > 260 - 120 * k) && ai.sx === c.face;
+      // Saltar si la pelota está cerca, a una altura alcanzable y hacia el arco rival.
+      const aim = dx * dir > 12;
+      if (aim && Math.abs(dx) < 60 + 50 * k && dy > 25 && dy < 190 && Math.random() < 0.4 + 0.6 * k) {
+        i.jump = true;
+        ai.jt = G.time;
+      }
+    }
+    // Retrocediendo con la pelota baja en el camino: saltarla (ventana según velocidad)
+    // para no empujarla al arco propio; si va lento, frena y espera.
+    const v = Math.abs(c.vx);
+    const inPath = ai.back && dx * dir < 0 && dy < 80 && sign(dx) === ai.sx;
+    if (inPath && Math.abs(dx) < 0.25 * v + 60) {
+      if (v > 250) {
+        i.jump = true;
+        ai.over = G.time;
+      } else if (Math.abs(dx) < 110) ai.rev = 0.35; // muy lento: retrocede para tomar impulso
+    }
+    if (inPath) i.boost = c.boost > 0;
+    if ((ai.rev -= dt) > 0) {
+      i.sx = -ai.sx;
+      i.boost = false;
+    }
+    return;
+  }
+  // En el aire: segundo salto o flip hacia la pelota si está a tiro.
+  const since = G.time - ai.jt;
+  const d = len(dx, dy);
   i.boost = false;
-  if (c.ground && Math.abs(dx) < 80 && c.y - b.y > 20 && c.y - b.y < 150) i.jump = true;
+  // Saltando por encima de la pelota: doble salto para ganar altura.
+  if (G.time - ai.over < 0.6 && c.canDouble && G.time - ai.over > 0.12 && dy < 30) {
+    i.sx = 0;
+    i.jump = true;
+    return;
+  }
+  if (c.canDouble && since > 0.12 && since < 1 && d < 85 + 35 * k && dx * dir > 12) {
+    i.sx = Math.abs(dx) > 18 ? sign(dx) : dir;
+    i.sy = dy > 45 ? -1 : dy < -30 ? 1 : 0;
+    if (dy > 70 && Math.abs(dx) < 30) i.sx = i.sy = 0; // pelota encima: doble salto
+    i.jump = true;
+    return;
+  }
+  // Mantenerse derecho para aterrizar sobre las ruedas.
+  const err = wrapAngle(c.a);
+  i.sx = Math.abs(err) > 0.25 ? -sign(err) : 0;
 }
 
 // ============================== RENDER ==============================
