@@ -95,6 +95,15 @@ const CFG = {
   timeBonus: 2, // pts por segundo de reloj restante (si gana por diferencia antes del final)
   demoBonus: 50, // pts por demolición hecha por P1
   shotSpeed: 450, // px/s hacia el arco rival tras un toque para contar como tiro
+  // --- Boost pads (en el suelo, simétricos) ---
+  padSmallX: [250, 340, 460, 550], // px, posiciones de pads chicos
+  padBigX: [140, 660], // px, posiciones de pads grandes
+  padSmall: 12, // boost que da un pad chico
+  padBig: 100, // boost que da un pad grande
+  padSmallRespawn: 4, // s
+  padBigRespawn: 10, // s
+  padPick: 24, // px, distancia horizontal para recoger (grande: x1.3)
+  padPickH: 55, // px, altura máx. del auto sobre el piso para recoger
   carCarRest: 0.3, // restitución auto–auto
   carCarMinPush: 120, // px/s, empuje mínimo entre autos al tocarse
 };
@@ -718,6 +727,54 @@ function shake(ms, intensity) {
   if (G.cam) G.cam.shake(ms, intensity, true);
 }
 
+// ============================== PADS ================================
+const PADS = [
+  ...CFG.padSmallX.map((x) => ({ x, big: false, t: 0 })),
+  ...CFG.padBigX.map((x) => ({ x, big: true, t: 0 })),
+];
+
+// t > 0: en cooldown. Un auto que pasa por encima recoge si no tiene el boost lleno.
+function padsStep(dt) {
+  for (const p of PADS) {
+    if (p.t > 0) {
+      p.t -= dt;
+      continue;
+    }
+    for (const c of G.cars) {
+      if (c.frozen || c.boost >= 100) continue;
+      if (Math.abs(c.x - p.x) > CFG.padPick * (p.big ? 1.3 : 1) || c.y < CFG.arenaB - CFG.padPickH) continue;
+      c.boost = Math.min(100, c.boost + (p.big ? CFG.padBig : CFG.padSmall));
+      p.t = p.big ? CFG.padBigRespawn : CFG.padSmallRespawn;
+      burst(p.x, CFG.arenaB - 6, p.big ? 26 : 10, COL.accent, p.big ? 260 : 150, 0.5, 3);
+      if (c.id === 0 || !c.cpu) sfx('pad', p.big ? 1 : 0.5);
+      break;
+    }
+  }
+}
+
+function drawPads(fx) {
+  const y = CFG.arenaB - 4;
+  for (const p of PADS) {
+    const r = p.big ? 14 : 8;
+    if (p.t > 0) {
+      // Cooldown: anillo tenue que se completa
+      const k = 1 - p.t / (p.big ? CFG.padBigRespawn : CFG.padSmallRespawn);
+      fx.lineStyle(2, 0x555a80, 0.8);
+      fx.beginPath();
+      fx.arc(p.x, y, r, Math.PI, Math.PI + Math.PI * k);
+      fx.strokePath();
+    } else {
+      const pulse = 0.5 + 0.5 * Math.sin(G.time * 6 + p.x);
+      fx.fillStyle(COL.accent, 0.12 + 0.1 * pulse);
+      fx.fillCircle(p.x, y, r * 2.2);
+      fx.fillStyle(COL.accent, 0.35);
+      fx.fillCircle(p.x, y, r * 1.4);
+      fx.fillStyle(p.big ? 0xffffff : COL.accent, 1);
+      fx.fillCircle(p.x, y, r * 0.7);
+    }
+  }
+}
+
 // ============================== CPU =================================
 // Genera inputs virtuales (mismas acciones que un jugador) en c.inp.
 function cpuThink(c, dt) {
@@ -947,6 +1004,7 @@ function render(scene, dt) {
     if (c.boosting && !c.frozen) drawFlame(fx, c);
     engineUpdate(c);
   }
+  drawPads(fx);
   drawParticles(fx, dt);
   // Estela de la pelota según velocidad
   b.trail.unshift({ x: b.x, y: b.y });
@@ -1022,6 +1080,7 @@ function sfx(name, k = 1) {
   // En la demo de fondo solo suenan la UI y (en attract) los goles.
   if (G.demo && name !== 'ui' && !(name === 'goal' && G.screen === 'attract')) return;
   if (name === 'ui') tone(660, 990, 0.07, 'square', 0.05);
+  else if (name === 'pad') tone(500, 1000 + 600 * k, 0.12, 'sine', 0.07);
   else if (name === 'tick') tone(1200, 1200, 0.06, 'square', 0.06);
   else if (name === 'end') [784, 659, 523, 1047].forEach((f, i) => tone(f, f, 0.3, 'triangle', 0.08, i * 0.15));
   else if (name === 'jump') tone(260, 520, 0.1, 'square', 0.05);
@@ -1266,6 +1325,7 @@ function newMatch(demo, cpu2) {
   G.ot = false;
   G.st = { shots: [0, 0], poss: [0, 0], demos: [0, 0] };
   G.lastTouch = -1;
+  for (const p of PADS) p.t = 0;
   G.ui.score[0].setText('0');
   G.ui.score[1].setText('0');
   G.ui.tag[1].setText(cpu2 && !demo ? 'CPU' : 'P2');
@@ -1494,6 +1554,7 @@ function step(dt) {
     carCar(G.cars[0], G.cars[1]);
     if (G.mode === 'play') checkGoal();
   }
+  padsStep(dt);
 }
 
 new Phaser.Game({
