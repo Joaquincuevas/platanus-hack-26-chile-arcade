@@ -36,8 +36,12 @@ const CFG = {
   ballDrag: 0.25, // 1/s, fricción del aire
   ballMax: 1500, // px/s, velocidad máxima
   // --- Easter egg BOUNCY PLATANUS ---
-  bananaChance: 1 / 15, // probabilidad por partido real
-  bananaAttract: 1 / 10, // probabilidad en la demo de ATTRACT
+  // Ocurre una vez por partido (también en ATTRACT) en el kickoff siguiente a un momento
+  // aleatorio entre bananaMin y bananaMax s de partido jugado.
+  bananaMin: 20, // s
+  bananaMax: 100, // s
+  bananaDur: 20, // s que dura (o hasta el próximo gol)
+  bananaGoalValue: 2, // goles que vale un gol con plátano
   bananaRest: 0.92, // restitución del plátano (piso y paredes)
   bananaGravity: 650, // px/s²
   ballSpinDamp: 0.3, // 1/s, amortiguación del giro visual en el aire
@@ -219,9 +223,6 @@ function createControls(scene) {
     if (!code) return;
     if (!held[code]) pressed[code] = true;
     G.lastInput = G.time;
-    // Últimas direcciones/botón 1 de cualquier joystick (código secreto del menú).
-    const t = code.slice(3);
-    if (code[0] === 'P' && 'UDLR1'.includes(t)) G.seq = (G.seq + t).slice(-9);
     if (SND.ctx && SND.ctx.state === 'suspended') SND.ctx.resume();
     held[code] = true;
   };
@@ -280,7 +281,7 @@ function validTop(v) {
   if (!Array.isArray(v)) return [];
   return v
     .filter((e) => e && typeof e.n === 'string' && /^[A-Z]{3}$/.test(e.n) && Number.isFinite(e.s) && e.s > 0)
-    .map((e) => ({ n: e.n, s: Math.round(e.s), d: /^[FMD]$/.test(e.d) ? e.d : '', p: e.p ? 1 : 0 }))
+    .map((e) => ({ n: e.n, s: Math.round(e.s), d: /^[FMD]$/.test(e.d) ? e.d : '' }))
     .sort((a, b) => b.s - a.s)
     .slice(0, 5);
 }
@@ -300,7 +301,7 @@ function qualifies(p) {
 }
 
 async function saveScore(n, sc) {
-  G.top = validTop([...G.top, { n, s: sc, d: CFG.cpuPresets[G.diff][1], p: G.banana ? 1 : 0 }]);
+  G.top = validTop([...G.top, { n, s: sc, d: CFG.cpuPresets[G.diff][1] }]);
   refreshTop();
   try {
     await storageSet(LB_KEY, G.top);
@@ -1411,7 +1412,7 @@ function noise(dur, vol, freq, type = 'lowpass', delay = 0) {
 // Efectos con nombre. k: intensidad 0..1.
 function sfx(name, k = 1) {
   // En la demo de fondo solo suenan la UI y (en attract) los goles.
-  if (G.demo && name !== 'ui' && !(name === 'goal' && G.screen === 'attract')) return;
+  if (G.demo && name !== 'ui' && !((name === 'goal' || name === 'banana') && G.screen === 'attract')) return;
   if (name === 'ui') tone(660, 990, 0.07, 'square', 0.05);
   else if (name === 'pad') tone(500, 1000 + 600 * k, 0.12, 'sine', 0.07);
   else if (name === 'tick') tone(1200, 1200, 0.06, 'square', 0.06);
@@ -1553,7 +1554,7 @@ function refreshMenu() {
 }
 
 function refreshTop() {
-  const t = G.top.map((e, i) => i + 1 + '. ' + e.n + '  ' + String(e.s).padStart(5, ' ') + ' ' + (e.d || ' ') + (e.p ? 'P' : ' '));
+  const t = G.top.map((e, i) => i + 1 + '. ' + e.n + '  ' + String(e.s).padStart(5, ' ') + ' ' + (e.d || ' '));
   G.ui.top.setText('- TOP 5 -\n' + (t.length ? t.join('\n') : 'sin récords aún'));
 }
 
@@ -1676,14 +1677,12 @@ const G = {
   st: null, // estadísticas del partido
   lastTouch: -1, // último auto que tocó la pelota
   debug: false, // overlay de debug (toggle con P1_6)
-  seq: '', // últimas entradas para el código secreto
   banana: false, // modo BOUNCY PLATANUS en el partido actual
 };
 
 function setScreen(sc) {
   G.screen = sc;
   G.screenT = 0;
-  G.seq = '';
   G.lastInput = G.time;
   for (const k in pressed) pressed[k] = false;
   refreshPanels();
@@ -1697,6 +1696,15 @@ function setDifficulty(i) {
   CFG.cpuSkill = p[3];
 }
 
+// Cambia entre pelota y plátano (misma colisión, otra física y gráfico).
+function setBanana(on) {
+  G.banana = on;
+  G.banT = CFG.bananaDur;
+  G.normG.setVisible(false);
+  G.banG.setVisible(false);
+  G.ballGfx = on ? G.banG : G.normG;
+}
+
 // Aviso grande temporal (punto de partido, easter egg).
 function flash(txt, color, ms) {
   const t = G.ui.mp.setText(txt).setColor(color).setAlpha(1).setScale(1.4);
@@ -1705,18 +1713,10 @@ function flash(txt, color, ms) {
 }
 
 function newMatch(demo, cpu2) {
-  // BOUNCY PLATANUS: código secreto, azar en partidos reales o (raro) en ATTRACT.
-  G.banana = demo
-    ? G.screen === 'attract' && Math.random() < CFG.bananaAttract
-    : G.code || Math.random() < CFG.bananaChance;
-  G.code = false;
-  G.normG.setVisible(false);
-  G.banG.setVisible(false);
-  G.ballGfx = G.banana ? G.banG : G.normG;
-  if (G.banana) {
-    flash('¡BOUNCY PLATANUS!', '#e1ff00', 2200);
-    if (!demo) sfx('banana');
-  }
+  // BOUNCY PLATANUS: se agenda un momento aleatorio del partido.
+  G.banAt = CFG.bananaMin + Math.random() * (CFG.bananaMax - CFG.bananaMin);
+  G.banState = 0; // 0 esperando, 1 pendiente (próximo kickoff), 2 activo/usado
+  setBanana(false);
   setDifficulty(demo ? 1 : G.diff); // la demo es MEDIA vs MEDIA
   G.demo = demo;
   G.cars[0].cpu = demo;
@@ -1748,6 +1748,14 @@ function toMenu() {
 
 // Reinicia posiciones y arranca la cuenta regresiva.
 function kickoff() {
+  // Plátano vencido (gol o tiempo): vuelve la pelota. Pendiente: aparece ahora.
+  if (G.banana && G.banT <= 0) setBanana(false);
+  if (G.banState === 1) {
+    G.banState = 2;
+    setBanana(true);
+    flash('¡BOUNCY PLATANUS!', '#e1ff00', 2200);
+    sfx('banana');
+  }
   placeCar(G.cars[0], CFG.arenaL + CFG.kickoffX, 1);
   placeCar(G.cars[1], CFG.arenaR - CFG.kickoffX, -1);
   for (const c of G.cars) c.frozen = true;
@@ -1765,7 +1773,7 @@ function kickoff() {
 // Gol a favor de `scorer` (0 = P1, 1 = P2).
 function goal(scorer) {
   const b = G.ball;
-  G.score[scorer]++;
+  G.score[scorer] += G.banana ? CFG.bananaGoalValue : 1;
   G.mode = 'goal';
   G.modeT = CFG.goalPause;
   G.timeScale = CFG.goalSlowMo;
@@ -1780,7 +1788,11 @@ function goal(scorer) {
   const t = G.ui.score[scorer];
   t.setText(String(G.score[scorer]));
   G.scene.tweens.add({ targets: t, scale: { from: 2.2, to: 1 }, duration: 500, ease: 'Back.Out' });
-  showBig('¡GOL!', scorer ? '#ff6ec7' : '#e1ff00', 1500);
+  showBig(G.banana ? '¡GOL PLATANUS! x2' : '¡GOL!', scorer ? '#ff6ec7' : '#e1ff00', 1500);
+  if (G.banana) {
+    G.banT = 0; // termina con el gol (vuelve la pelota en el kickoff, tras la repetición)
+    burst(b.x, b.y, 60, COL.accent, 500, 1, 4);
+  }
 }
 
 // Gol si el centro de la pelota pasó bajo el travesaño hasta cerca del fondo del arco.
@@ -1879,14 +1891,6 @@ function nameInput() {
 function tickScreen(dt) {
   G.screenT += dt;
   const idle = G.time - G.lastInput;
-  // Código secreto (↑↑↓↓←→←→ + botón 1, cualquier joystick): partido 1P en modo plátano.
-  if (G.screen === 'menu' && G.seq === 'UUDDLRLR1') {
-    G.seq = '';
-    G.code = true;
-    consume('P2_1');
-    startMatch(true);
-    return;
-  }
   const go = () => consume('START1') || consume('START2') || consume('P1_1');
   if (G.screen === 'attract') {
     if (Object.keys(pressed).some((k) => pressed[k])) setScreen('menu');
@@ -1945,6 +1949,14 @@ function tickMode(dt) {
     } else {
       const prev = Math.ceil(G.clock);
       G.clock = Math.max(0, G.clock - dt);
+      if (!G.banState && CFG.matchTime - G.clock >= G.banAt) G.banState = 1;
+      // Plátano activo: dura bananaDur s; al vencer explota y se reanuda con kickoff.
+      if (G.banana && (G.banT -= dt) <= 0) {
+        burst(G.ball.x, G.ball.y, 70, COL.accent, 550, 1, 4);
+        shake(250, 0.015);
+        sfx('boom');
+        kickoff();
+      }
       const n = Math.ceil(G.clock);
       if (n < prev && n > 0 && n <= CFG.finalCount) {
         showBig(String(n), '#ff5050', 600);
