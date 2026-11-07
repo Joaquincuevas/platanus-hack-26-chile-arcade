@@ -93,7 +93,7 @@ const CFG = {
   endDelay: 1.2, // s antes de aceptar input en END (evita saltarlo sin querer)
   nameIdle: 30, // s sin input al escribir nombre → guarda lo que haya
   musicBpm: 132, // tempo de la música de partido (sube 15% en los últimos 10 s)
-  musicVol: 1, // multiplicador de volumen de la música (0 = sin música)
+  musicVol: 0.6, // multiplicador de volumen de la música (0 = sin música)
   replayFrames: 90, // cuadros guardados para la repetición (~1.5 s a 60 fps)
   replaySpeed: 0.4, // velocidad de la repetición (cámara lenta)
   replayDelay: 0.9, // s de celebración antes de la repetición
@@ -112,9 +112,30 @@ const CFG = {
   carCarRest: 0.3, // restitución auto–auto
   carCarMinPush: 120, // px/s, empuje mínimo entre autos al tocarse
   // --- CPU ---
-  cpuReact: 0.16, // s, retardo medio entre decisiones (más alto = más lenta)
-  cpuSkill: 0.6, // 0..1: predicción, puntería de saltos y uso de boost
-  cpuThreat: 150, // px/s de la pelota hacia su arco para volver a defender
+  cpuReact: 0.16, // s, retardo medio entre decisiones (lo fija el preset de dificultad)
+  cpuSkill: 0.6, // 0..1: ruido en salto/impacto, predicción y boost (lo fija el preset)
+  cpuLook: 1.2, // s, horizonte de predicción de la pelota (simulada con ballStep)
+  cpuDefendT: 1.2, // s, si la predicción entra a su arco antes de esto → DEFENDER
+  cpuGuardX: 45, // px delante del extremo del travesaño donde se para a defender
+  cpuRotateX: 150, // px por detrás de la pelota a donde vuelve al ROTAR
+  cpuKickWait: 0, // probabilidad de que una CPU (al azar) espere defendiendo en el kickoff
+  cpuKickWaitT: 1.2, // s que espera en la guardia antes de salir
+  cpuShadowLead: 0, // px de ventaja del rival hacia la pelota para pasar a SOMBRA
+  cpuShadowK: 0.4, // fracción de la distancia arco→pelota donde se para en SOMBRA
+  cpuPassH: 130, // px: si la pelota está más alta que esto sobre el piso, pasa por debajo al rotar
+  cpuShadowX: 130, // px que mantiene delante de una pelota baja mientras rota
+  cpuFrontDot: 0.35, // dot mínimo (golpe hacia el arco rival) para saltar/flipear a la pelota
+  cpuBehind: 25, // px que debe estar detrás de la pelota para ATACAR
+  cpuReachH: 200, // px sobre el piso hasta donde intenta alcanzar la pelota
+  cpuOwnDot: 0.15, // si el golpe apunta a su arco (dot > esto) no golpea: esquiva/salta
+  cpuJumpNoise: 0.2, // s, retraso máx. aleatorio del salto con skill 0 (escala con 1-skill)
+  cpuAimNoise: 40, // px, error máx. del punto de impacto con skill 0
+  // Presets [nombre, letra, cpuReact, cpuSkill, multiplicador de puntaje]
+  cpuPresets: [
+    ['FÁCIL', 'F', 0.36, 0.1, 0.75],
+    ['MEDIA', 'M', 0.16, 0.6, 1],
+    ['DIFÍCIL', 'D', 0.09, 0.95, 1.5],
+  ],
   demoSpeed: 800, // px/s del atacante para demoler (≈95% de maxBoostSpeed: supersónico)
   demoAim: 0.8, // cos del ángulo máx. entre la velocidad del atacante y la víctima
   demoRespawn: 2, // s hasta que reaparece la víctima en su lado
@@ -247,7 +268,7 @@ function validTop(v) {
   if (!Array.isArray(v)) return [];
   return v
     .filter((e) => e && typeof e.n === 'string' && /^[A-Z]{3}$/.test(e.n) && Number.isFinite(e.s) && e.s > 0)
-    .map((e) => ({ n: e.n, s: Math.round(e.s) }))
+    .map((e) => ({ n: e.n, s: Math.round(e.s), d: /^[FMD]$/.test(e.d) ? e.d : '' }))
     .sort((a, b) => b.s - a.s)
     .slice(0, 5);
 }
@@ -267,7 +288,7 @@ function qualifies(p) {
 }
 
 async function saveScore(n, sc) {
-  G.top = validTop([...G.top, { n, s: sc }]);
+  G.top = validTop([...G.top, { n, s: sc, d: CFG.cpuPresets[G.diff][1] }]);
   refreshTop();
   try {
     await storageSet(LB_KEY, G.top);
@@ -416,6 +437,7 @@ function ballStep(b, dt) {
 
 // Hook de feedback para rebotes fuertes contra la arena (se completa en game feel).
 function onBallBounce(b, impact, s) {
+  if (G.sim) return; // predicción de la CPU: sin efectos
   const k = Math.min(1, impact / 1200);
   sfx('bounce', k);
   if (impact > 600) burst(s.px, s.py, 6 + 10 * k, 0xffffff, 120 + 200 * k, 0.3, 2);
@@ -825,77 +847,134 @@ function drawPads(fx) {
 
 // ============================== CPU =================================
 // Genera inputs virtuales en c.inp (las mismas acciones que un jugador); no toca la física.
-// Decide cada ~CFG.cpuReact s; entre decisiones mantiene el último input (se siente humano).
-// Comportamientos: ponerse detrás de la pelota, ir a pegarle, volver a defender, saltar/flip.
+// Cada ~cpuReact s planifica con una predicción de la pelota y elige un rol:
+//  DEFENDER si la pelota entra a su arco pronto, ATACAR si está detrás de la pelota,
+//  ROTAR (volver hacia su arco sin tocarla) en otro caso.
+
+// Simula una copia de la pelota con la misma física; puntos cada 1/30 s.
+function predictBall(T) {
+  const p = { ...G.ball, trail: null };
+  const pts = [];
+  G.sim = true;
+  for (let t = 1 / 60, n = 0; t <= T; t += 1 / 60, n++) {
+    ballStep(p, 1 / 60);
+    if (n & 1) pts.push({ x: p.x, y: p.y, t });
+  }
+  G.sim = false;
+  return pts;
+}
+
+function cpuPlan(c, ai, dir, k) {
+  ai.t = CFG.cpuReact * (0.6 + Math.random() * 0.8);
+  const b = G.ball;
+  const path = predictBall(CFG.cpuLook * (0.5 + 0.5 * k));
+  const mouth = (c.id ? CFG.arenaR : CFG.arenaL) + dir * CFG.goalD;
+  const guard = mouth + dir * CFG.cpuGuardX;
+  const into = path.find((p) => p.y > A.barY && (p.x - mouth) * dir < 0);
+  const speed = CFG.maxDrive + (c.boost > 20 ? 250 : 0);
+  // Primer punto alcanzable a tiempo y a altura de golpe.
+  const P =
+    path.find((p) => Math.abs(p.x - c.x) / speed <= p.t + 0.1 && p.y > CFG.arenaB - CFG.cpuReachH) ||
+    path[path.length - 1] ||
+    b;
+  ai.def = (into && into.t < CFG.cpuDefendT) || G.time < ai.wait;
+  const goalSide = (P.x - c.x) * dir > CFG.cpuBehind;
+  let tx;
+  // SOMBRA: el rival llega antes a la pelota y ataca hacia mi arco → no disputarla,
+  // quedarse entre la pelota y el arco propio, más cerca del arco.
+  const o = G.cars[1 - c.id];
+  const shadow =
+    !o.dead && Math.abs(o.x - b.x) < Math.abs(c.x - b.x) - CFG.cpuShadowLead && (b.x - o.x) * dir < 0;
+  if (shadow && goalSide && !ai.def) {
+    ai.role = 'SHD';
+    tx = guard + dir * clamp((b.x - guard) * dir * CFG.cpuShadowK, 0, 260);
+  } else if (G.time < ai.wait) {
+    ai.role = 'DEF'; // kickoff defensivo
+    tx = guard;
+  } else if (goalSide) {
+    // ATACAR (o despejar defendiendo): llegar por detrás del punto de impacto.
+    ai.role = ai.def ? 'DEF' : 'ATK';
+    tx = P.x - dir * CFG.ballR * 0.5 + (Math.random() - 0.5) * CFG.cpuAimNoise * (1 - k);
+  } else {
+    // ROTAR: volver detrás de la pelota pasando por debajo si va alta; si va baja,
+    // acompañarla a distancia sin tocarla. Con peligro, directo a la guardia del arco.
+    ai.role = ai.def ? 'DEF' : 'ROT';
+    tx = ai.def
+      ? guard
+      : b.y < CFG.arenaB - CFG.cpuPassH
+        ? P.x - dir * CFG.cpuRotateX
+        : b.x + dir * CFG.cpuShadowX;
+    if ((tx - guard) * dir < 0) tx = guard;
+  }
+  ai.tx = clamp(tx, CFG.arenaL + 40, CFG.arenaR - 40);
+  ai.urgent = ai.def || Math.abs(ai.tx - c.x) > 300 - 140 * k;
+}
+
 function cpuThink(c, dt) {
   const i = c.inp;
-  const ai = c.ai || (c.ai = { t: 0, sx: 0, boost: false, jt: -9, over: -9, rev: 0 });
+  const ai = c.ai || (c.ai = { t: 0, tx: c.x, jt: -9, over: -9, rev: 0, jq: -1, wait: 0 });
   const b = G.ball;
   const k = CFG.cpuSkill;
   const dir = c.id ? -1 : 1; // hacia el arco rival
   i.jump = false;
   i.sy = 0;
+  i.boost = false;
   ai.t -= dt;
+  if (ai.t <= 0) cpuPlan(c, ai, dir, k);
   const dx = b.x - c.x;
   const dy = c.y - b.y; // > 0: pelota arriba del auto
+  const d = len(dx, dy) || 1;
+  // Hacia dónde saldría la pelota si la toca ahora (normal auto→pelota).
+  const own = (-dx / d) * dir > CFG.cpuOwnDot; // apunta a su propio arco
+  const front = (dx / d) * dir > CFG.cpuFrontDot; // apunta al arco rival
+  // Pelota que viene de frente hacia el auto (tiro rival): se puede bloquear saltando.
+  const incoming = b.vx * dir < -100 && dx * dir > -20;
   if (c.ground) {
-    // En pared/techo no insiste: se deja caer.
-    const wall = c.ny > -0.5;
-    i.sx = wall ? 0 : ai.sx;
-    i.boost = ai.boost && !wall;
-    if (ai.t <= 0) {
-      ai.t = CFG.cpuReact * (0.6 + Math.random() * 0.8);
-      const look = 0.2 + 0.3 * k; // s de predicción de la pelota
-      let px = clamp(b.x + b.vx * look, CFG.arenaL + 50, CFG.arenaR - 50);
-      // Pelota todavía delante pero la predicción la pasa: interceptar donde está el auto.
-      if ((c.x - px) * dir > 0 && (c.x - b.x) * dir <= 0) px = c.x;
-      const own = c.id ? CFG.arenaR : CFG.arenaL;
-      const threat = (b.vx * dir < -CFG.cpuThreat && (b.x - A.cx) * dir < 120) || Math.abs(b.x - own) < 260;
-      let tx;
-      ai.back = (c.x - b.x) * dir > 0;
-      if (ai.back) {
-        // Lado equivocado: rodear por detrás o volver al arco si hay peligro.
-        tx = threat ? (c.id ? CFG.arenaR - 110 : CFG.arenaL + 110) : px - dir * 150;
-      } else tx = px + dir * 40; // ir a pegarle atravesando la pelota
-      const ddx = tx - c.x;
-      ai.sx = Math.abs(ddx) > 14 ? sign(ddx) : 0;
-      ai.boost = c.boost > 10 && (threat || Math.abs(ddx) > 260 - 120 * k) && ai.sx === c.face;
-      // Saltar si la pelota está cerca, a una altura alcanzable y hacia el arco rival.
-      const aim = dx * dir > 12;
-      if (aim && Math.abs(dx) < 60 + 50 * k && dy > 25 && dy < 190 && Math.random() < 0.4 + 0.6 * k) {
-        i.jump = true;
-        ai.jt = G.time;
-      }
-    }
-    // Retrocediendo con la pelota baja en el camino: saltarla (ventana según velocidad)
-    // para no empujarla al arco propio; si va lento, frena y espera.
-    const v = Math.abs(c.vx);
-    const inPath = ai.back && dx * dir < 0 && dy < 80 && sign(dx) === ai.sx;
-    if (inPath && Math.abs(dx) < 0.25 * v + 60) {
-      if (v > 250) {
+    const wall = c.ny > -0.5; // en pared/techo no insiste: se deja caer
+    const ddx = ai.tx - c.x;
+    i.sx = wall || Math.abs(ddx) < 12 ? 0 : sign(ddx);
+    i.boost = !wall && ai.urgent && c.boost > 5 && i.sx === c.face;
+    // Velocidad de acercamiento a la pelota (relativa) para cronometrar el salto por encima.
+    const vr = (c.vx - b.vx) * sign(dx);
+    const close = Math.abs(dx) < 0.25 * vr + 75 && dy < 90 && sign(dx) === i.sx;
+    if (own && close) {
+      // Anti-autogol: saltar por encima si se acerca rápido; si no, retroceder.
+      if (vr > 230) {
         i.jump = true;
         ai.over = G.time;
-      } else if (Math.abs(dx) < 110) ai.rev = 0.35; // muy lento: retrocede para tomar impulso
-    }
-    if (inPath) i.boost = c.boost > 0;
+      } else if (Math.abs(dx) < 110) ai.rev = 0.3;
+      else i.boost = c.boost > 0; // tomar impulso para el salto
+    } else if (!front && Math.abs(dx) < 50 && dy > 60 && b.vy > 0) {
+      // Pelota cayendo encima sin ángulo de ataque: apartarse hacia su lado del campo.
+      i.sx = -dir;
+    } else if (
+      (front && Math.abs(dx) < 55 + 50 * k && dy > 30 && dy < 190) ||
+      (incoming && dy > 30 && dy < 200 && Math.abs(dx) / (Math.abs(b.vx - c.vx) + 1) < 0.1 + dy / 700)
+    ) {
+      // Saltar a la pelota con un retraso aleatorio (más error con menos skill).
+      if (ai.jq < 0) ai.jq = G.time + Math.random() * CFG.cpuJumpNoise * (1 - k);
+      if (G.time >= ai.jq) {
+        i.jump = true;
+        ai.jt = G.time;
+        ai.jq = -1;
+      }
+    } else ai.jq = -1;
     if ((ai.rev -= dt) > 0) {
-      i.sx = -ai.sx;
+      i.sx = -sign(dx);
       i.boost = false;
     }
     return;
   }
-  // En el aire: segundo salto o flip hacia la pelota si está a tiro.
   const since = G.time - ai.jt;
-  const d = len(dx, dy);
-  i.boost = false;
   // Saltando por encima de la pelota: doble salto para ganar altura.
   if (G.time - ai.over < 0.6 && c.canDouble && G.time - ai.over > 0.12 && dy < 30) {
     i.sx = 0;
     i.jump = true;
     return;
   }
-  if (c.canDouble && since > 0.12 && since < 1 && d < 85 + 35 * k && dx * dir > 12) {
-    i.sx = Math.abs(dx) > 18 ? sign(dx) : dir;
+  // Flip hacia el arco rival si la pelota está delante y a tiro.
+  if (c.canDouble && (front || incoming) && since > 0.1 && since < 1 && d < 85 + 35 * k) {
+    i.sx = dir;
     i.sy = dy > 45 ? -1 : dy < -30 ? 1 : 0;
     if (dy > 70 && Math.abs(dx) < 30) i.sx = i.sy = 0; // pelota encima: doble salto
     i.jump = true;
@@ -1334,7 +1413,7 @@ function createUI(scene) {
     dim: scene.add.rectangle(W / 2, H / 2, W, H, 0x000000, 0.6).setDepth(60),
     title: tx(W / 2, 140, 'TURBO GOL', 84, '#e1ff00', 61).setStroke('#ff6ec7', 6),
     opts: [tx(W / 2, 265, '', 26, '#ffffff', 61), tx(W / 2, 305, '', 26, '#ffffff', 61)],
-    help: tx(W / 2, 385, 'JOYSTICK mover / rotar   BOTÓN 1 saltar / flip   BOTÓN 2 turbo', 13, '#9aa0ff', 61),
+    help: tx(W / 2, 385, 'JOYSTICK mover / rotar   BOTÓN 1 saltar / flip   BOTÓN 2 turbo\n<- / -> dificultad (1 jugador)', 13, '#9aa0ff', 61),
     press: tx(W / 2, 270, 'PRESIONA START', 34, '#ffffff', 61),
     top: tx(W / 2, 480, '', 16, '#ffffff', 61),
     panel: tx(W / 2, 300, '', 22, '#ffffff', 61).setLineSpacing(8),
@@ -1362,14 +1441,14 @@ function refreshPanels() {
 }
 
 function refreshMenu() {
-  ['1 JUGADOR (vs CPU)', '2 JUGADORES'].forEach((t, i) => {
+  ['1 JUGADOR  < ' + CFG.cpuPresets[G.diff][0] + ' >', '2 JUGADORES'].forEach((t, i) => {
     const on = G.menuSel === i;
-    G.ui.opts[i].setText(on ? '> ' + t + ' <' : t).setColor(on ? '#e1ff00' : '#777a99');
+    G.ui.opts[i].setText(on ? '> ' + t : t).setColor(on ? '#e1ff00' : '#777a99');
   });
 }
 
 function refreshTop() {
-  const t = G.top.map((e, i) => i + 1 + '. ' + e.n + '  ' + String(e.s).padStart(5, ' '));
+  const t = G.top.map((e, i) => i + 1 + '. ' + e.n + '  ' + String(e.s).padStart(5, ' ') + ' ' + (e.d || ' '));
   G.ui.top.setText('- TOP 5 -\n' + (t.length ? t.join('\n') : 'sin récords aún'));
 }
 
@@ -1479,6 +1558,7 @@ const G = {
   demo: true, // partido CPU vs CPU de fondo
   solo: true, // modo 1 jugador
   menuSel: 0,
+  diff: 1, // dificultad elegida para 1P (índice en CFG.cpuPresets)
   top: [], // top 5 [{n, s}]
   st: null, // estadísticas del partido
   lastTouch: -1, // último auto que tocó la pelota
@@ -1494,7 +1574,15 @@ function setScreen(sc) {
 }
 
 // Nuevo partido. demo: ambos autos CPU (fondo de menú/attract). cpu2: P2 es CPU.
+// Fija cpuReact/cpuSkill según el preset (0 FÁCIL, 1 MEDIA, 2 DIFÍCIL).
+function setDifficulty(i) {
+  const p = CFG.cpuPresets[i];
+  CFG.cpuReact = p[2];
+  CFG.cpuSkill = p[3];
+}
+
 function newMatch(demo, cpu2) {
+  setDifficulty(demo ? 1 : G.diff); // la demo es MEDIA vs MEDIA
   G.demo = demo;
   G.cars[0].cpu = demo;
   G.cars[1].cpu = demo || cpu2;
@@ -1587,7 +1675,7 @@ function endMatch() {
   // Puntaje 1P (solo si gana a la CPU): diferencia + reloj restante + demoliciones.
   if (G.solo && G.winner === 0) {
     G.pts = [(a - b) * 100, Math.ceil(G.clock) * CFG.timeBonus, G.st.demos[0] * CFG.demoBonus];
-    G.points = G.pts[0] + G.pts[1] + G.pts[2];
+    G.points = Math.round((G.pts[0] + G.pts[1] + G.pts[2]) * CFG.cpuPresets[G.diff][4]);
   }
   sfx('end');
   if (G.points > 0 && qualifies(G.points)) {
@@ -1609,13 +1697,13 @@ function showEnd() {
     .setText(
       [
         'FINAL',
-        'P1  ' + a + ' - ' + b + '  ' + n2,
+        'P1  ' + a + ' - ' + b + '  ' + n2 + (G.solo ? '  (' + CFG.cpuPresets[G.diff][0] + ')' : ''),
         win,
         '',
         'TIROS        ' + st.shots[0] + ' - ' + st.shots[1],
         'POSESIÓN   ' + p1 + '% - ' + (100 - p1) + '%',
         'DEMOLICIONES ' + st.demos[0] + ' - ' + st.demos[1],
-        G.points ? 'PUNTAJE ' + G.points + '  (' + G.pts.join(' + ') + ')' : '',
+        G.points ? 'PUNTAJE ' + G.points + '  ((' + G.pts.join(' + ') + ') x' + CFG.cpuPresets[G.diff][4] + ')' : '',
         '',
         'START para revancha',
       ].join('\n')
@@ -1658,6 +1746,12 @@ function tickScreen(dt) {
   if (G.screen === 'attract') {
     if (Object.keys(pressed).some((k) => pressed[k])) setScreen('menu');
   } else if (G.screen === 'menu') {
+    const lr = ['P1_R', 'P2_R'].filter(consume).length - ['P1_L', 'P2_L'].filter(consume).length;
+    if (lr) {
+      G.diff = clamp(G.diff + lr, 0, 2);
+      refreshMenu();
+      sfx('ui');
+    }
     const mv = ['P1_U', 'P1_D', 'P2_U', 'P2_D'].filter(consume).length;
     if (mv) {
       G.menuSel ^= mv & 1;
@@ -1688,7 +1782,12 @@ function tickMode(dt) {
     }
     if (G.modeT <= 0) {
       G.mode = 'play';
-      for (const c of G.cars) c.frozen = false;
+      // Kickoff: a lo más una CPU (al azar) se queda defendiendo; evita choques simétricos.
+      const w = Math.random() < CFG.cpuKickWait ? (Math.random() * 2) | 0 : -1;
+      for (const c of G.cars) {
+        c.frozen = false;
+        if (c.ai) c.ai.wait = c.id === w ? G.time + CFG.cpuKickWaitT : 0;
+      }
       if (G.screen === 'match') for (const k in pressed) pressed[k] = false;
       showBig('¡YA!', '#e1ff00', 600);
       sfx('go');
