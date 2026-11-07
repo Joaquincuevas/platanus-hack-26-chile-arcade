@@ -18,21 +18,28 @@ const CFG = {
   arenaT: 76, // px, techo
   arenaB: 584, // px, piso
   cornerR: 90, // px, radio de las 4 esquinas (las inferiores son rampas)
-  goalH: 150, // px, alto de la boca del arco (a ras de suelo)
+  goalH: 115, // px, alto de la boca del arco (a ras de suelo)
   goalD: 90, // px, profundidad del arco = largo del travesaño
   barR: 7, // px, radio (grosor/2) del travesaño
-  goalLine: 10, // px, cuánto debe pasar el centro de la pelota el extremo del travesaño para ser gol
+  barSlide: 700, // px/s², empuje hacia la cancha de una pelota apoyada sobre el travesaño
+  goalLine: 40, // px que el centro de la pelota debe pasar el extremo del travesaño (≈ pelota entera adentro)
   glow: false, // bool, postFX glow real (WebGL). Caro: ~3x menos FPS en GPU débil
 
   // --- Pelota ---
   ballR: 32, // px
   ballGravity: 820, // px/s² (menor que la del auto: se siente "flotante")
-  ballRest: 0.75, // restitución contra la arena
+  ballRest: 0.75, // restitución contra el piso (y rampas bajas)
+  ballWallRest: 0.5, // restitución contra paredes y techo
   ballRestV: 45, // px/s, bajo esta velocidad normal no rebota (reposo estable)
   ballImpactFric: 0.06, // fracción de vel. tangencial perdida en cada impacto
   ballRollFric: 0.35, // 1/s, resistencia al rodar mientras está en contacto
-  ballDrag: 0.1, // 1/s, fricción del aire
+  ballDrag: 0.25, // 1/s, fricción del aire
   ballMax: 1500, // px/s, velocidad máxima
+  // --- Easter egg BOUNCY PLATANUS ---
+  bananaChance: 1 / 15, // probabilidad por partido real
+  bananaAttract: 1 / 10, // probabilidad en la demo de ATTRACT
+  bananaRest: 0.92, // restitución del plátano (piso y paredes)
+  bananaGravity: 650, // px/s²
   ballSpinDamp: 0.3, // 1/s, amortiguación del giro visual en el aire
 
   // --- Auto ---
@@ -86,7 +93,7 @@ const CFG = {
   matchTime: 120, // s, reloj del partido (solo corre en PLAY)
   finalCount: 10, // s, últimos segundos mostrados en grande con tick
   otMax: 90, // s, tope del tiempo extra (si nadie marca: empate, evita estado sin salida)
-  mercyGoals: 5, // goles de diferencia que terminan el partido antes de tiempo
+  goalLimit: 5, // goles para ganar: el partido termina al llegar a esto o al acabarse el reloj
   matchIdle: 45, // s sin ningún input humano durante un partido → vuelve al MENU
   attractIdle: 20, // s sin input en el MENU → ATTRACT (demo CPU vs CPU)
   endIdle: 15, // s sin input en END → MENU
@@ -97,7 +104,7 @@ const CFG = {
   replayFrames: 90, // cuadros guardados para la repetición (~1.5 s a 60 fps)
   replaySpeed: 0.4, // velocidad de la repetición (cámara lenta)
   replayDelay: 0.9, // s de celebración antes de la repetición
-  timeBonus: 2, // pts por segundo de reloj restante (si gana por diferencia antes del final)
+  timeBonus: 4, // pts por segundo de reloj restante al llegar a goalLimit
   demoBonus: 50, // pts por demolición hecha por P1
   shotSpeed: 450, // px/s hacia el arco rival tras un toque para contar como tiro
   // --- Boost pads (en el suelo, simétricos) ---
@@ -122,6 +129,8 @@ const CFG = {
   cpuKickWaitT: 1.2, // s que espera en la guardia antes de salir
   cpuShadowLead: 0, // px de ventaja del rival hacia la pelota para pasar a SOMBRA
   cpuShadowK: 0.4, // fracción de la distancia arco→pelota donde se para en SOMBRA
+  cpuFlipP: 0.5, // probabilidad de flip (vs doble salto) al llegar a la pelota en el aire
+  cpuStuckT: 0.7, // s trabado sin avanzar antes de saltar
   cpuPassH: 130, // px: si la pelota está más alta que esto sobre el piso, pasa por debajo al rotar
   cpuShadowX: 130, // px que mantiene delante de una pelota baja mientras rota
   cpuFrontDot: 0.35, // dot mínimo (golpe hacia el arco rival) para saltar/flipear a la pelota
@@ -210,6 +219,9 @@ function createControls(scene) {
     if (!code) return;
     if (!held[code]) pressed[code] = true;
     G.lastInput = G.time;
+    // Últimas direcciones/botón 1 de cualquier joystick (código secreto del menú).
+    const t = code.slice(3);
+    if (code[0] === 'P' && 'UDLR1'.includes(t)) G.seq = (G.seq + t).slice(-9);
     if (SND.ctx && SND.ctx.state === 'suspended') SND.ctx.resume();
     held[code] = true;
   };
@@ -268,7 +280,7 @@ function validTop(v) {
   if (!Array.isArray(v)) return [];
   return v
     .filter((e) => e && typeof e.n === 'string' && /^[A-Z]{3}$/.test(e.n) && Number.isFinite(e.s) && e.s > 0)
-    .map((e) => ({ n: e.n, s: Math.round(e.s), d: /^[FMD]$/.test(e.d) ? e.d : '' }))
+    .map((e) => ({ n: e.n, s: Math.round(e.s), d: /^[FMD]$/.test(e.d) ? e.d : '', p: e.p ? 1 : 0 }))
     .sort((a, b) => b.s - a.s)
     .slice(0, 5);
 }
@@ -288,7 +300,7 @@ function qualifies(p) {
 }
 
 async function saveScore(n, sc) {
-  G.top = validTop([...G.top, { n, s: sc, d: CFG.cpuPresets[G.diff][1] }]);
+  G.top = validTop([...G.top, { n, s: sc, d: CFG.cpuPresets[G.diff][1], p: G.banana ? 1 : 0 }]);
   refreshTop();
   try {
     await storageSet(LB_KEY, G.top);
@@ -349,7 +361,7 @@ function barSurface(bar, x, y) {
   const cx = clamp(x, bar.x0, bar.x1);
   const n = norm(x - cx, y - A.barY, 0, y < A.barY ? -1 : 1);
   const d = len(x - cx, y - A.barY) - CFG.barR;
-  return { dist: d, nx: n.x, ny: n.y, px: cx + n.x * CFG.barR, py: A.barY + n.y * CFG.barR };
+  return { dist: d, nx: n.x, ny: n.y, px: cx + n.x * CFG.barR, py: A.barY + n.y * CFG.barR, bar: 1 };
 }
 
 // Resuelve penetración de un círculo (body: x, y, vx, vy) contra una superficie.
@@ -376,11 +388,12 @@ function resolveCircle(b, r, s, e, fr, restV) {
 
 // Colisiona un círculo contra toda la arena (y travesaños si withBars).
 // Devuelve el mayor impacto y la última superficie tocada (o null).
-function collideCircle(b, r, e, fr, restV, withBars) {
+// eWall: restitución para paredes/techo (superficies que no son piso).
+function collideCircle(b, r, e, fr, restV, withBars, eWall = e) {
   let best = -1;
   let surf = null;
   const s = closestSurface(b.x, b.y);
-  let imp = resolveCircle(b, r, s, e, fr, restV);
+  let imp = resolveCircle(b, r, s, s.ny < -0.7 ? e : eWall, fr, restV);
   if (imp >= 0) {
     best = imp;
     surf = s;
@@ -406,7 +419,7 @@ function makeBall() {
 function ballStep(b, dt) {
   if (!b.active) return;
   b.onFloor = false;
-  b.vy += CFG.ballGravity * dt;
+  b.vy += (G.banana ? CFG.bananaGravity : CFG.ballGravity) * dt;
   const k = Math.max(0, 1 - CFG.ballDrag * dt);
   b.vx *= k;
   b.vy *= k;
@@ -417,7 +430,8 @@ function ballStep(b, dt) {
   }
   b.x += b.vx * dt;
   b.y += b.vy * dt;
-  const c = collideCircle(b, CFG.ballR, CFG.ballRest, CFG.ballImpactFric, CFG.ballRestV, true);
+  const e = G.banana ? CFG.bananaRest : CFG.ballRest;
+  const c = collideCircle(b, CFG.ballR, e, CFG.ballImpactFric, CFG.ballRestV, true, G.banana ? e : CFG.ballWallRest);
   if (c.s) {
     // En contacto: resistencia al rodar y giro = velocidad tangencial / radio.
     const tx = -c.s.ny;
@@ -428,6 +442,8 @@ function ballStep(b, dt) {
     b.vy = ty * vt + c.s.ny * vn;
     b.spin = vt / CFG.ballR;
     if (c.s.ny < -0.7) b.onFloor = true;
+    // Sobre el travesaño la pelota resbala hacia la cancha (no queda inalcanzable).
+    if (c.s.bar && c.s.ny < -0.5) b.vx += sign(A.cx - b.x) * CFG.barSlide * dt;
     if (c.impact > 250) onBallBounce(b, c.impact, c.s);
   } else {
     b.spin *= Math.max(0, 1 - CFG.ballSpinDamp * dt);
@@ -439,7 +455,8 @@ function ballStep(b, dt) {
 function onBallBounce(b, impact, s) {
   if (G.sim) return; // predicción de la CPU: sin efectos
   const k = Math.min(1, impact / 1200);
-  sfx('bounce', k);
+  sfx(G.banana ? 'boing' : 'bounce', k);
+  G.wob = 1;
   if (impact > 600) burst(s.px, s.py, 6 + 10 * k, 0xffffff, 120 + 200 * k, 0.3, 2);
 }
 
@@ -899,9 +916,11 @@ function cpuPlan(c, ai, dir, k) {
     // ROTAR: volver detrás de la pelota pasando por debajo si va alta; si va baja,
     // acompañarla a distancia sin tocarla. Con peligro, directo a la guardia del arco.
     ai.role = ai.def ? 'DEF' : 'ROT';
-    tx = ai.def
-      ? guard
-      : b.y < CFG.arenaB - CFG.cpuPassH
+    // Si además el rival llega antes a la pelota, volver directo a la guardia.
+    tx =
+      ai.def || Math.abs(o.x - b.x) < Math.abs(c.x - b.x)
+        ? guard
+      : b.y < CFG.arenaB - CFG.cpuPassH || len(b.vx, b.vy) < 80 // alta o quieta: cruzarla
         ? P.x - dir * CFG.cpuRotateX
         : b.x + dir * CFG.cpuShadowX;
     if ((tx - guard) * dir < 0) tx = guard;
@@ -959,6 +978,12 @@ function cpuThink(c, dt) {
         ai.jq = -1;
       }
     } else ai.jq = -1;
+    // Trabado (p. ej. empujando al otro auto): saltar para destrabarse.
+    if ((ai.st = (ai.st || 0) + dt) > CFG.cpuStuckT) {
+      if (Math.abs(c.x - (ai.lx || 0)) < 25 && Math.abs(ai.tx - c.x) > 40) i.jump = true;
+      ai.st = 0;
+      ai.lx = c.x;
+    }
     if ((ai.rev -= dt) > 0) {
       i.sx = -sign(dx);
       i.boost = false;
@@ -974,7 +999,8 @@ function cpuThink(c, dt) {
   }
   // Flip hacia el arco rival si la pelota está delante y a tiro.
   if (c.canDouble && (front || incoming) && since > 0.1 && since < 1 && d < 85 + 35 * k) {
-    i.sx = dir;
+    // No siempre flipea (el flip la deja pasada de largo): a veces solo doble salto.
+    i.sx = Math.random() < CFG.cpuFlipP ? dir : 0;
     i.sy = dy > 45 ? -1 : dy < -30 ? 1 : 0;
     if (dy > 70 && Math.abs(dx) < 30) i.sx = i.sy = 0; // pelota encima: doble salto
     i.jump = true;
@@ -1017,22 +1043,12 @@ function drawArena(scene) {
   // Campo
   g.fillStyle(COL.field, 1);
   g.fillRoundedRect(L, T, R - L, B - T, CR);
-  // Arcos: red con color del dueño
-  const goals = [
-    { x: L, c: COL.p1 },
-    { x: R - CFG.goalD, c: COL.p2 },
-  ];
-  for (const gl of goals) {
-    g.fillStyle(gl.c, 0.1);
-    g.fillRect(gl.x, A.barY, CFG.goalD, CFG.goalH);
-    g.lineStyle(1, gl.c, 0.25);
-    for (let x = gl.x; x <= gl.x + CFG.goalD; x += 15) g.lineBetween(x, A.barY, x, B);
-    for (let y = A.barY; y <= B; y += 15) g.lineBetween(gl.x, y, gl.x + CFG.goalD, y);
-  }
-  // Tapar lo que sobresale de la red detrás de las rampas
-  g.fillStyle(COL.bg, 1);
-  g.fillPoints([{ x: L - 2, y: B + 2 }, ...arcPoints(L + CR, B - CR, CR, Math.PI, Math.PI / 2, 16)], true);
-  g.fillPoints([{ x: R + 2, y: B + 2 }, ...arcPoints(R - CR, B - CR, CR, 0, Math.PI / 2, 16)], true);
+  // Tinte del cuarto de cancha propio (P1 izquierda, P2 derecha)
+  const q = (R - L) / 4;
+  g.fillStyle(COL.p1, 0.035);
+  g.fillRoundedRect(L, T, q, B - T, { tl: CR, tr: 0, bl: CR, br: 0 });
+  g.fillStyle(COL.p2, 0.035);
+  g.fillRoundedRect(R - q, T, q, B - T, { tl: 0, tr: CR, bl: 0, br: CR });
   // Marcas de cancha
   g.lineStyle(2, COL.line, 0.25);
   g.lineBetween(A.cx, T + 10, A.cx, B - 10);
@@ -1044,9 +1060,11 @@ function drawArena(scene) {
     [4, 0.35],
     [2, 1],
   ];
+  // El borde va en su propia capa, encima de la red (que se dibuja cada frame).
+  const ob = scene.add.graphics().setDepth(2);
   for (const [w, a] of layers) {
-    g.lineStyle(w, COL.line, a);
-    g.strokeRoundedRect(L, T, R - L, B - T, CR);
+    ob.lineStyle(w, COL.line, a);
+    ob.strokeRoundedRect(L, T, R - L, B - T, CR);
   }
   // Travesaños (capa superior: los autos pasan por detrás)
   const fg = scene.add.graphics().setDepth(20);
@@ -1061,12 +1079,91 @@ function drawArena(scene) {
   });
 }
 
+// Arcos (cada frame): red en perspectiva que se infla al recibir gol, línea de gol
+// discontinua y poste con luz que pulsa más rápido/intenso con la pelota cerca.
+function drawGoals(dt) {
+  const g = G.goalG;
+  const { arenaL: L, arenaR: R, arenaB: B, cornerR: CR } = CFG;
+  g.clear();
+  const b = G.ball;
+  for (let i = 0; i < 2; i++) {
+    const col = i ? COL.p2 : COL.p1;
+    const mx = i ? R - CFG.goalD : L + CFG.goalD; // boca
+    const out = i ? 1 : -1; // hacia el fondo del arco
+    G.net[i] = Math.max(0, G.net[i] - dt * 1.4);
+    const bulge = Math.sin(G.net[i] * Math.PI) * 16;
+    const fl = G.net[i];
+    const bx = (i ? R : L) + out * bulge; // fondo (se infla)
+    const top = A.barY + 28 - bulge * 0.6;
+    const bot = B - 14;
+    g.fillStyle(0x000000, 0.5);
+    g.fillPoints([{ x: mx, y: A.barY }, { x: bx, y: top }, { x: bx, y: bot }, { x: mx, y: B }], true);
+    g.fillStyle(col, 0.06 + fl * 0.35);
+    g.fillPoints([{ x: mx, y: A.barY }, { x: bx, y: top }, { x: bx, y: bot }, { x: mx, y: B }], true);
+    g.lineStyle(1, fl > 0.4 ? 0xffffff : col, 0.3 + fl * 0.6);
+    for (let j = 0; j <= 6; j++) {
+      const t = j / 6;
+      g.lineBetween(mx, A.barY + (B - A.barY) * t, bx, top + (bot - top) * t);
+    }
+    for (const u of [0.3, 0.55, 0.75, 0.9, 1]) {
+      const x = mx + (bx - mx) * u;
+      g.lineBetween(x, A.barY + (top - A.barY) * u, x, B + (bot - B) * u);
+    }
+    // Fondo de la cancha detrás de la rampa (tapa la red fuera de la arena)
+    g.fillStyle(COL.bg, 1);
+    g.fillPoints(
+      [{ x: i ? R + 20 : L - 20, y: B + 2 }, ...arcPoints(i ? R - CR : L + CR, B - CR, CR, i ? 0 : Math.PI, Math.PI / 2, 12)],
+      true
+    );
+    // Línea de gol discontinua en la boca
+    g.lineStyle(2, col, 0.7);
+    for (let y = A.barY + 6; y < B; y += 14) g.lineBetween(mx, y, mx, Math.min(B, y + 8));
+    // Poste con luz: más intensa y rápida con la pelota cerca (peligro).
+    const dk = b.active ? clamp(1 - len(b.x - mx, b.y - (A.barY + B) / 2) / 260, 0, 1) : 0;
+    const p = 0.5 + 0.5 * Math.sin(G.time * (3 + 14 * dk));
+    g.lineStyle(12, col, 0.06 + (0.12 + 0.35 * dk) * p);
+    g.lineBetween(mx, A.barY, mx, B);
+    g.lineStyle(3, col, 0.75);
+    g.lineBetween(mx, A.barY, mx, B);
+    g.fillStyle(0xffffff, 0.5 + 0.5 * p);
+    g.fillCircle(mx, A.barY, 3 + 2 * p + 3 * dk);
+  }
+}
+
+// Flechas "ATACA" sobre cada auto durante la cuenta regresiva.
+function drawArrows() {
+  const on = G.mode === 'kickoff' && (G.screen === 'match' || G.screen === 'attract');
+  G.cars.forEach((c, i) => {
+    G.ui.arrow[i]
+      .setVisible(on)
+      .setPosition(c.x + (i ? -10 : 10) + Math.sin(G.time * 7) * 5 * (i ? -1 : 1), c.y - 46);
+  });
+}
+
 // Glow opcional (solo WebGL).
 function addGlow(obj, color, strength) {
   if (CFG.glow && obj.postFX) obj.postFX.addGlow(color, strength, 0, false, 0.1, 12);
 }
 
 // Gráfico de la pelota en coordenadas locales (rota con b.rot).
+// Plátano en coordenadas locales (colisión: mismo círculo que la pelota).
+function makeBananaGfx(scene) {
+  const g = scene.add.graphics().setDepth(8).setVisible(false);
+  const arc = (w, c, r0, r1) => {
+    g.lineStyle(w, c, 1);
+    g.beginPath();
+    g.arc(0, -30, 40, r0, r1);
+    g.strokePath();
+  };
+  arc(22, 0xc9b300, 0.45, 2.7);
+  arc(16, COL.accent, 0.5, 2.65);
+  arc(4, 0xffffff, 0.9, 2.1); // brillo
+  g.fillStyle(0x6b4a1e, 1);
+  g.fillCircle(Math.cos(0.45) * 40, Math.sin(0.45) * 40 - 30, 6);
+  g.fillCircle(Math.cos(2.7) * 40, Math.sin(2.7) * 40 - 30, 5);
+  return g;
+}
+
 function makeBallGfx(scene) {
   const r = CFG.ballR;
   const g = scene.add.graphics().setDepth(8);
@@ -1219,7 +1316,11 @@ function render(scene, dt) {
     drawReplay(dt);
     return;
   }
-  G.ballGfx.setVisible(b.active).setPosition(b.x, b.y).setRotation(b.rot);
+  // Squash & stretch tras cada rebote (más notorio con el plátano).
+  G.wob = Math.max(0, (G.wob || 0) - dt * 3);
+  const w = Math.sin(G.time * 40) * G.wob * (G.banana ? 0.25 : 0.06);
+  G.ballGfx.setVisible(b.active).setPosition(b.x, b.y).setRotation(b.rot).setScale(1 + w, 1 - w);
+  if (G.banana && b.active && len(b.vx, b.vy) > 150) spark(b.x, b.y, b.vx * -0.2, b.vy * -0.2, COL.accent, 0.5, 3);
   const fx = G.fx;
   fx.clear();
   for (const c of G.cars) {
@@ -1242,7 +1343,7 @@ function render(scene, dt) {
   b.trail.unshift({ x: b.x, y: b.y });
   if (b.trail.length > 10) b.trail.pop();
   const sp = len(b.vx, b.vy);
-  if (b.active && sp > 450) {
+  if (b.active && sp > 450 && !G.banana) {
     const a = Math.min(1, (sp - 450) / 700);
     b.trail.forEach((p, i) => {
       fx.fillStyle(0xffffff, (0.25 * a * (10 - i)) / 10);
@@ -1326,7 +1427,9 @@ function sfx(name, k = 1) {
   } else if (name === 'hit') {
     tone(160, 50, 0.16, 'sine', 0.2 + 0.4 * k);
     noise(0.1 + 0.1 * k, 0.12 + 0.3 * k, 1200 + 3000 * k);
-  } else if (name === 'bounce') {
+  } else if (name === 'boing') tone(180, 520 + 500 * k, 0.22, 'sine', 0.12 + 0.1 * k);
+  else if (name === 'banana') [659, 784, 988, 784, 1319].forEach((f, i) => tone(f, f * 1.02, 0.14, 'triangle', 0.09, i * 0.1));
+  else if (name === 'bounce') {
     tone(140, 70, 0.08, 'sine', 0.12 * k);
   } else if (name === 'boom') {
     noise(0.8, 0.6, 700);
@@ -1417,6 +1520,8 @@ function createUI(scene) {
     press: tx(W / 2, 270, 'PRESIONA START', 34, '#ffffff', 61),
     top: tx(W / 2, 480, '', 16, '#ffffff', 61),
     panel: tx(W / 2, 300, '', 22, '#ffffff', 61).setLineSpacing(8),
+    arrow: [tx(0, 0, 'ATACA >>', 14, '#e1ff00', 31), tx(0, 0, '<< ATACA', 14, '#ff6ec7', 31)],
+    mp: tx(W / 2, 330, '¡PUNTO DE PARTIDO!', 40, '#ff5050', 41).setAlpha(0),
     rep: tx(W / 2, 92, 'REPETICIÓN', 24, '#ff5050', 31).setVisible(false),
   };
   G.dbg = scene.add.graphics().setDepth(50);
@@ -1448,7 +1553,7 @@ function refreshMenu() {
 }
 
 function refreshTop() {
-  const t = G.top.map((e, i) => i + 1 + '. ' + e.n + '  ' + String(e.s).padStart(5, ' ') + ' ' + (e.d || ' '));
+  const t = G.top.map((e, i) => i + 1 + '. ' + e.n + '  ' + String(e.s).padStart(5, ' ') + ' ' + (e.d || ' ') + (e.p ? 'P' : ' '));
   G.ui.top.setText('- TOP 5 -\n' + (t.length ? t.join('\n') : 'sin récords aún'));
 }
 
@@ -1484,7 +1589,15 @@ function drawHud() {
     .setColor(G.ot || t <= CFG.finalCount ? '#ff5050' : '#ffffff');
   G.ui.rep.setVisible(!!G.replay);
   G.ui.clock.setVisible(!G.replay);
-  G.ui.ot.setText(G.ot ? 'GOL DE ORO' : G.clock <= 0 && G.mode === 'play' ? 'ÚLTIMA JUGADA' : '');
+  G.ui.ot.setText(
+    G.ot
+      ? 'GOL DE ORO'
+      : G.clock <= 0 && G.mode === 'play'
+        ? 'ÚLTIMA JUGADA'
+        : G.mode === 'kickoff' && !G.score[0] && !G.score[1]
+          ? 'PRIMERO A ' + CFG.goalLimit
+          : ''
+  );
   G.ui.press.setAlpha(Math.floor(G.time * 2.5) % 2 ? 1 : 0.15);
 }
 
@@ -1563,11 +1676,14 @@ const G = {
   st: null, // estadísticas del partido
   lastTouch: -1, // último auto que tocó la pelota
   debug: false, // overlay de debug (toggle con P1_6)
+  seq: '', // últimas entradas para el código secreto
+  banana: false, // modo BOUNCY PLATANUS en el partido actual
 };
 
 function setScreen(sc) {
   G.screen = sc;
   G.screenT = 0;
+  G.seq = '';
   G.lastInput = G.time;
   for (const k in pressed) pressed[k] = false;
   refreshPanels();
@@ -1581,7 +1697,26 @@ function setDifficulty(i) {
   CFG.cpuSkill = p[3];
 }
 
+// Aviso grande temporal (punto de partido, easter egg).
+function flash(txt, color, ms) {
+  const t = G.ui.mp.setText(txt).setColor(color).setAlpha(1).setScale(1.4);
+  G.scene.tweens.add({ targets: t, scale: 1, duration: 300, ease: 'Back.Out' });
+  G.scene.tweens.add({ targets: t, alpha: 0, delay: ms - 400, duration: 400 });
+}
+
 function newMatch(demo, cpu2) {
+  // BOUNCY PLATANUS: código secreto, azar en partidos reales o (raro) en ATTRACT.
+  G.banana = demo
+    ? G.screen === 'attract' && Math.random() < CFG.bananaAttract
+    : G.code || Math.random() < CFG.bananaChance;
+  G.code = false;
+  G.normG.setVisible(false);
+  G.banG.setVisible(false);
+  G.ballGfx = G.banana ? G.banG : G.normG;
+  if (G.banana) {
+    flash('¡BOUNCY PLATANUS!', '#e1ff00', 2200);
+    if (!demo) sfx('banana');
+  }
   setDifficulty(demo ? 1 : G.diff); // la demo es MEDIA vs MEDIA
   G.demo = demo;
   G.cars[0].cpu = demo;
@@ -1589,6 +1724,7 @@ function newMatch(demo, cpu2) {
   G.score = [0, 0];
   G.clock = CFG.matchTime;
   G.ot = false;
+  G.mp = [0, 0];
   G.st = { shots: [0, 0], poss: [0, 0], demos: [0, 0] };
   G.lastTouch = -1;
   for (const p of PADS) p.t = 0;
@@ -1634,6 +1770,7 @@ function goal(scorer) {
   G.modeT = CFG.goalPause;
   G.timeScale = CFG.goalSlowMo;
   b.active = false;
+  G.net[1 - scorer] = 1; // la red del arco que recibió el gol se infla y destella
   const col = scorer ? COL.p2 : COL.p1;
   burst(b.x, b.y, 90, col, 650, 1.1, 4);
   burst(b.x, b.y, 40, 0xffffff, 450, 0.8, 3);
@@ -1742,6 +1879,14 @@ function nameInput() {
 function tickScreen(dt) {
   G.screenT += dt;
   const idle = G.time - G.lastInput;
+  // Código secreto (↑↑↓↓←→←→ + botón 1, cualquier joystick): partido 1P en modo plátano.
+  if (G.screen === 'menu' && G.seq === 'UUDDLRLR1') {
+    G.seq = '';
+    G.code = true;
+    consume('P2_1');
+    startMatch(true);
+    return;
+  }
   const go = () => consume('START1') || consume('START2') || consume('P1_1');
   if (G.screen === 'attract') {
     if (Object.keys(pressed).some((k) => pressed[k])) setScreen('menu');
@@ -1825,9 +1970,19 @@ function tickMode(dt) {
     if (G.modeT < CFG.goalPause - CFG.goalSlowMoTime) G.timeScale = Math.min(1, G.timeScale + dt * 2);
     if (G.modeT <= 0) {
       if (G.ot) endMatch();
-      else if (Math.abs(G.score[0] - G.score[1]) >= CFG.mercyGoals) endMatch();
+      else if (Math.max(...G.score) >= CFG.goalLimit) endMatch();
       else if (G.clock <= 0) timeUp();
-      else kickoff();
+      else {
+        kickoff();
+        // A un gol de ganar: aviso grande por 1.5 s (una vez por jugador).
+        G.score.forEach((v, i) => {
+          if (v === CFG.goalLimit - 1 && !G.mp[i]) {
+            G.mp[i] = 1;
+            flash('¡PUNTO DE PARTIDO!', i ? '#ff6ec7' : '#e1ff00', 1500);
+            sfx('tick');
+          }
+        });
+      }
     }
   }
 }
@@ -1875,9 +2030,12 @@ function create() {
   drawArena(this);
   G.cam = this.cameras.main;
   G.fx = this.add.graphics().setDepth(6);
+  G.goalG = this.add.graphics().setDepth(1);
+  G.net = [0, 0];
   G.scene = this;
   G.ball = makeBall();
-  G.ballGfx = makeBallGfx(this);
+  G.normG = G.ballGfx = makeBallGfx(this);
+  G.banG = makeBananaGfx(this);
   G.cars = [makeCar(0), makeCar(1)];
   for (const c of G.cars) c.gfx = makeCarGfx(this, c);
   audioInit(this);
@@ -1903,7 +2061,9 @@ function update(time, deltaMs) {
       G.acc -= CFG.dt;
     }
   }
+  drawGoals(dt);
   render(this, dt);
+  drawArrows();
   musicUpdate();
   drawHud();
   drawDebug(this);
