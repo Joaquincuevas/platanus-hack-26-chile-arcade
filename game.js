@@ -1,4 +1,4 @@
-// TURBO GOL — Platanus Hack 26
+// LIGA DEL PLÁTANO — Platanus Hack 26
 // Fútbol de autos 1v1 en vista lateral. Física propia, Phaser solo para loop/render/input/audio.
 
 // ============================== CONFIG ==============================
@@ -1515,7 +1515,7 @@ function createUI(scene) {
     dbg: scene.add.text(26, 82, '', { fontFamily: FONT, fontSize: '11px', color: '#00ffff' }).setDepth(51),
     // Pantallas (menú, attract, fin, nombre)
     dim: scene.add.rectangle(W / 2, H / 2, W, H, 0x000000, 0.6).setDepth(60),
-    title: tx(W / 2, 140, 'TURBO GOL', 84, '#e1ff00', 61).setStroke('#ff6ec7', 6),
+    title: tx(W / 2, 140, 'LIGA DEL\nPLÁTANO', 62, '#e1ff00', 61).setStroke('#ff6ec7', 6).setLineSpacing(-6),
     opts: [tx(W / 2, 265, '', 26, '#ffffff', 61), tx(W / 2, 305, '', 26, '#ffffff', 61)],
     help: tx(W / 2, 385, 'JOYSTICK mover / rotar   BOTÓN 1 saltar / flip   BOTÓN 2 turbo\n<- / -> dificultad (1 jugador)', 13, '#9aa0ff', 61),
     press: tx(W / 2, 270, 'PRESIONA START', 34, '#ffffff', 61),
